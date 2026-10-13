@@ -84,10 +84,12 @@ class TestParam:
                 raise RuntimeError(f"Unknown test_target: {test_target}")
         elif kk.is_on_cuda_platform():
             cc_major, cc_minor = get_current_compute_capability()
-            if cc_major != 10:
-                return False    # Only sm100a / sm103a is supported
+            if cc_major not in (10, 12):
+                return False    # Only sm100a / sm103a and sm120a are supported
             if self.h_q not in (64, 128) or self.d_qk != 512:
                 return False
+            if cc_major == 12 and test_target != TestTarget.DECODE:
+                return False    # sm120a has sparse decoding only
 
             if test_target == TestTarget.SPARSE_FWD:
                 if self.topk < 128:

@@ -54,7 +54,16 @@ struct Arch {
     bool is_sm100f() const {
         return major == 10;
     }
+
+    bool is_sm120f() const {
+        return major == 12;
+    }
 };
+
+// Which CUDA kernel families this build contains (set by setup.py from FLASH_MLA_CUDA_ARCHS)
+#if !defined(FLASH_MLA_ENABLE_SM100) && !defined(FLASH_MLA_ENABLE_SM120)
+#define FLASH_MLA_ENABLE_SM100
+#endif
 #endif  // FLASH_MLA_IS_BUILD_ON_CUDA
 
 // For CUDA GPU, return the number of Stream Multiprocessor (SM)s; For Ascend NPU, return the number of AI Cores

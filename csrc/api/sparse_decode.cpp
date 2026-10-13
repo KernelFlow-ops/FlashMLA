@@ -41,11 +41,14 @@ public:
 
 
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+#include "cuda_kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
+#include "cuda_kernels/smxx/decode/combine/combine.h"
+#endif  // FLASH_MLA_IS_BUILD_ON_CUDA
+
+#if defined(FLASH_MLA_IS_BUILD_ON_CUDA) && defined(FLASH_MLA_ENABLE_SM100)
 
 #include "cuda_kernels/sm100/decode/sparse/head64/kernel.h"
 #include "cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
-#include "cuda_kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
-#include "cuda_kernels/smxx/decode/combine/combine.h"
 
 class SparseDecode_Sm100_Head64_Impl : public SparseDecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
@@ -120,7 +123,43 @@ protected:
     }
 };
 
-#endif  // FLASH_MLA_IS_BUILD_ON_CUDA
+#endif  // FLASH_MLA_IS_BUILD_ON_CUDA && FLASH_MLA_ENABLE_SM100
+
+#if defined(FLASH_MLA_IS_BUILD_ON_CUDA) && defined(FLASH_MLA_ENABLE_SM120)
+
+#include "cuda_kernels/sm120/decode/sparse/kernel.h"
+
+// sm120 (RTX 50 / RTX PRO Blackwell): mma.sync based kernel, one CTA per (query token, 64 heads); h_q = 128 runs two CTAs
+class SparseDecode_Sm120_Impl : public SparseDecodeImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        SparseDecodeFeatures::HEAD_64,
+        SparseDecodeFeatures::HEAD_128,
+        SparseDecodeFeatures::ATTN_SINK,
+        SparseDecodeFeatures::TOPK_LENGTH,
+        SparseDecodeFeatures::EXTRA_KVCACHE,
+        SparseDecodeFeatures::EXTRA_TOPK_LENGTH,
+        SparseDecodeFeatures::BATCH_INVARIANT
+    )
+
+public:
+    SparseDecodeImplMeta get_meta(int h_q, int s_q) override {
+        Arch arch = Arch();
+        // The combine kernel handles at most 160 splits per request (MLA_NUM_SPLITS_SWITCH)
+        int num_sm_parts = std::max(std::min(arch.num_sms / s_q / (h_q / 64), 160), 1);
+        return {
+            num_sm_parts,
+            5,
+            sm120::decode::sparse::B_TOPK
+        };
+    }
+
+protected:
+    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        sm120::decode::sparse::run_sparse_decode(params);
+    }
+};
+
+#endif  // FLASH_MLA_IS_BUILD_ON_CUDA && FLASH_MLA_ENABLE_SM120
 
 #ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
 
@@ -187,7 +226,14 @@ sparse_decode_fwd(
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     // Check the architecture
     Arch arch = Arch();
-    TORCH_CHECK(arch.is_sm100f(), "Sparse Attention Decode Kernel (sparse_decode_fwd) is only supported on SM100f architectures.");
+    bool arch_supported = false;
+#ifdef FLASH_MLA_ENABLE_SM100
+    arch_supported |= arch.is_sm100f();
+#endif
+#ifdef FLASH_MLA_ENABLE_SM120
+    arch_supported |= arch.is_sm120f();
+#endif
+    TORCH_CHECK(arch_supported, "Sparse Attention Decode Kernel (sparse_decode_fwd) is not built for this GPU (sm_", arch.major, arch.minor, "); FLASH_MLA_CUDA_ARCHS selects sm_100a / sm_103a or sm_120a.");
 #endif
     KU_CHECK_NDIM(q, 4);
     KU_CHECK_NDIM(kv, 4);
@@ -332,10 +378,21 @@ sparse_decode_fwd(
 
     SparseDecodeImplBase* impl;
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
-    if (h_q == 64) {
-        impl = new SparseDecode_Sm100_Head64_Impl();
-    } else {
-        impl = new SparseDecode_Sm100_Head128_Impl();
+#ifdef FLASH_MLA_ENABLE_SM120
+    if (arch.is_sm120f()) {
+        impl = new SparseDecode_Sm120_Impl();
+    } else
+#endif
+    {
+#ifdef FLASH_MLA_ENABLE_SM100
+        if (h_q == 64) {
+            impl = new SparseDecode_Sm100_Head64_Impl();
+        } else {
+            impl = new SparseDecode_Sm100_Head128_Impl();
+        }
+#else
+        TORCH_CHECK(false, "unreachable: no decode implementation for this architecture");
+#endif
     }
 
     SparseDecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);

@@ -24,19 +24,36 @@ EXT_NAME_ASCEND = "flash_mla.npu"
 # `-gencode` targets. We use the architecture-specific ones (sm_100a / sm_103a) instead of the
 # family-specific one (sm_100f) because the kernels use `cvt` with `.scaled::n2::ue8m0`, and
 # sm_103a additionally enables better code generation for `exp`.
-CUDA_ARCHS = ["sm_100a", "sm_103a"]
+# FLASH_MLA_CUDA_ARCHS (comma separated) overrides the list, e.g. "sm_120a" builds only the sm120
+# (RTX 50 / RTX PRO Blackwell) kernels. A build contains either the sm10x or the sm12x kernels:
+# every source is compiled for every listed target, and neither family compiles for the other.
+CUDA_ARCHS = [a.strip() for a in os.getenv("FLASH_MLA_CUDA_ARCHS", "sm_100a,sm_103a").split(",") if a.strip()]
+ENABLE_SM100 = any(a.startswith("sm_10") for a in CUDA_ARCHS)
+ENABLE_SM120 = any(a.startswith("sm_12") for a in CUDA_ARCHS)
+assert CUDA_ARCHS and all(a.startswith(("sm_10", "sm_12")) for a in CUDA_ARCHS), \
+    f"FLASH_MLA_CUDA_ARCHS={CUDA_ARCHS}: only sm_10x and sm_12x targets are supported"
+assert not (ENABLE_SM100 and ENABLE_SM120), \
+    "FLASH_MLA_CUDA_ARCHS cannot mix sm_10x and sm_12x targets; build them separately"
 
 # Head counts (H_Q) the fused core_attn kernel is instantiated for: 128 (2-CTA cluster) and 64
 HEADS_FOR_FUSED_CORE_ATTN = (64, 128)
 
-CUDA_KERNEL_SOURCES = [
-    # sm100 dense prefill (cutlass FMHA): forward and backward
-    "csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
-    "csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
-
+# Architecture-independent kernels
+SMXX_KERNEL_SOURCES = [
     # Small kernels for decoding: tile scheduler metadata generation and the split-KV combine
     "csrc/cuda_kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
     "csrc/cuda_kernels/smxx/decode/combine/combine.cu",
+]
+
+# sm120 sparse decode (mma.sync), every `.cu` under csrc/cuda_kernels/sm120
+SM120_KERNEL_SOURCES = sorted(
+    p.relative_to(THIS_DIR).as_posix() for p in (THIS_DIR / "csrc" / "cuda_kernels" / "sm120").rglob("*.cu")
+)
+
+SM100_KERNEL_SOURCES = [
+    # sm100 dense prefill (cutlass FMHA): forward and backward
+    "csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
+    "csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
 
     # sm100 sparse prefill
     "csrc/cuda_kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k512.cu",
@@ -64,6 +81,12 @@ CUDA_KERNEL_SOURCES = [
     "csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.cu",
     "csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.cu",
 ]
+
+CUDA_KERNEL_SOURCES = (
+    SMXX_KERNEL_SOURCES
+    + (SM100_KERNEL_SOURCES if ENABLE_SM100 else [])
+    + (SM120_KERNEL_SOURCES if ENABLE_SM120 else [])
+)
 
 # The Ascend instantiations are explicit template instantiations of `run_sparse_fwd_kernel`.
 # Kept for: h64 x {prefill, decode} x {V4.1 fp8, V4.1 fp4 (decode only)} x {sink, nosink}
@@ -105,8 +128,15 @@ def build_on_cuda_platform():
     nvcc_version_number = nvcc_version.split("release ")[1].split(",")[0].strip()
     major, minor = map(int, nvcc_version_number.split("."))
     print(f"Compiling using NVCC {major}.{minor}")
-    assert major > 13 or (major == 13 and minor >= 1), \
-        "Compiling the kernels requires NVCC 13.1 or higher (cvt with .scaled::n2::ue8m0)."
+    if ENABLE_SM100:
+        assert major > 13 or (major == 13 and minor >= 1), \
+            "Compiling the SM100 kernels requires NVCC 13.1 or higher (cvt with .scaled::n2::ue8m0)."
+    if ENABLE_SM120:
+        assert major > 12 or (major == 12 and minor >= 8), \
+            "Compiling the SM120 kernels requires NVCC 12.8 or higher (sm_120a block-scaled mma.sync)."
+    print(f"CUDA targets: {CUDA_ARCHS}")
+    arch_defines = (["-DFLASH_MLA_ENABLE_SM100"] if ENABLE_SM100 else []) + \
+        (["-DFLASH_MLA_ENABLE_SM120"] if ENABLE_SM120 else [])
 
     class BuildExtensionWithPostActions(BuildExtension):
         """
@@ -158,7 +188,7 @@ def build_on_cuda_platform():
                     "-Wno-deprecated-declarations",
                     "-DFLASH_MLA_IS_BUILD_ON_CUDA",
                     "-DKERUTILS_IS_BUILD_ON_CUDA",
-                ],
+                ] + arch_defines,
                 "nvcc": get_nvcc_thread_args() + [
                     "-O3",
                     "-std=c++20",
@@ -176,7 +206,7 @@ def build_on_cuda_platform():
                     "--diag-suppress=445",  # "constant "N" is not used in declaring the parameter types of function template"
                     "-DNDEBUG",
                     "-DFLASH_MLA_IS_BUILD_ON_CUDA",
-                ] + get_cuda_arch_flags(),
+                ] + arch_defines + get_cuda_arch_flags(),
             },
             include_dirs=[
                 THIS_DIR / "csrc",

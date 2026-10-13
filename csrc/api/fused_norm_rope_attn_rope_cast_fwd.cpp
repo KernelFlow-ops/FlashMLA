@@ -1,6 +1,6 @@
 #include "common.h"
 
-#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+#if defined(FLASH_MLA_IS_BUILD_ON_CUDA) && defined(FLASH_MLA_ENABLE_SM100)
 
 #include "params.h"
 
@@ -50,7 +50,7 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     bool round_sf,
     bool use_packed_ue8m0
 ) {
-#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+#if defined(FLASH_MLA_IS_BUILD_ON_CUDA) && defined(FLASH_MLA_ENABLE_SM100)
     Arch arch = Arch();
     bool is_sm100f = arch.is_sm100f();
     TORCH_CHECK(is_sm100f, "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_fwd) is only supported on SM100f architectures.");
@@ -182,7 +182,7 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
 
     return {out_fp8, out_sf, max_logits, lse};
 #else
-    TORCH_CHECK(false, "fused_norm_rope_attn_rope_cast_fwd is only supported on CUDA GPUs.");
+    TORCH_CHECK(false, "fused_norm_rope_attn_rope_cast_fwd is only supported on CUDA builds with SM100 kernels (FLASH_MLA_CUDA_ARCHS containing sm_100a / sm_103a).");
 #endif
 }
 
@@ -211,7 +211,7 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     bool round_sf,
     bool use_packed_ue8m0
 ) {
-#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+#if defined(FLASH_MLA_IS_BUILD_ON_CUDA) && defined(FLASH_MLA_ENABLE_SM100)
     Arch arch = Arch();
     TORCH_CHECK(arch.is_sm100f(), "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_decode) is only supported on SM100f architectures.");
 
@@ -414,7 +414,7 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
 
     return {out_fp8, out_sf, lse};
 #else
-    TORCH_CHECK(false, "fused_norm_rope_attn_rope_cast_decode is only supported on CUDA GPUs.");
+    TORCH_CHECK(false, "fused_norm_rope_attn_rope_cast_decode is only supported on CUDA builds with SM100 kernels (FLASH_MLA_CUDA_ARCHS containing sm_100a / sm_103a).");
 #endif
 }
 
@@ -425,7 +425,7 @@ std::vector<at::Tensor> permute_q_b_proj(
     int h_q,
     int d_q
 ) {
-#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+#if defined(FLASH_MLA_IS_BUILD_ON_CUDA) && defined(FLASH_MLA_ENABLE_SM100)
     KU_CHECK_NDIM(q_b_proj, 2);
     KU_CHECK_NDIM(scale_factors, 2);
 
@@ -477,7 +477,7 @@ std::vector<at::Tensor> permute_q_b_proj(
 
     return {q_b_proj_permuted, scale_factors_permuted};
 #else
-    TORCH_CHECK(false, "permute_q_b_proj is only supported on CUDA GPUs.");
+    TORCH_CHECK(false, "permute_q_b_proj is only supported on CUDA builds with SM100 kernels (FLASH_MLA_CUDA_ARCHS containing sm_100a / sm_103a).");
 #endif
 }
 
@@ -488,7 +488,7 @@ std::vector<at::Tensor> permute_wv_proj(
     int wv_group_size,
     int d_o
 ) {
-#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+#if defined(FLASH_MLA_IS_BUILD_ON_CUDA) && defined(FLASH_MLA_ENABLE_SM100)
     KU_CHECK_NDIM(wv_proj, 3);
     KU_CHECK_NDIM(scale_factors, 3);
 
@@ -545,7 +545,7 @@ std::vector<at::Tensor> permute_wv_proj(
 
     return {wv_proj_permuted, scale_factors_permuted};
 #else
-    TORCH_CHECK(false, "permute_wv_proj is only supported on CUDA GPUs.");
+    TORCH_CHECK(false, "permute_wv_proj is only supported on CUDA builds with SM100 kernels (FLASH_MLA_CUDA_ARCHS containing sm_100a / sm_103a).");
 #endif
 }
 

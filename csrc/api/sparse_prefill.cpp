@@ -14,7 +14,7 @@ class SparseFwdImplBase : public ImplBase<
     SparseFwdFeatures
 > {};
 
-#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+#if defined(FLASH_MLA_IS_BUILD_ON_CUDA) && defined(FLASH_MLA_ENABLE_SM100)
 
 #include "cuda_kernels/sm100/prefill/sparse/fwd/head64/phase1.h"
 #include "cuda_kernels/sm100/prefill/sparse/fwd/head128/phase1.h"
@@ -101,7 +101,11 @@ static std::vector<at::Tensor> sparse_prefill_fwd(
 ) {
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Arch arch = Arch();
+#ifdef FLASH_MLA_ENABLE_SM100
     TORCH_CHECK(arch.is_sm100f(), "Sparse Attention Prefill Kernel (sparse_prefill_fwd) is only supported on SM100f architectures.");
+#else
+    TORCH_CHECK(false, "Sparse Attention Prefill Kernel (sparse_prefill_fwd) is not built: FLASH_MLA_CUDA_ARCHS has no sm_100a / sm_103a.");
+#endif
 #endif
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
@@ -195,7 +199,7 @@ static std::vector<at::Tensor> sparse_prefill_fwd(
         required_features.push_back(SparseFwdFeatures::TOPK_LENGTH);
     }
 
-#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+#if defined(FLASH_MLA_IS_BUILD_ON_CUDA) && defined(FLASH_MLA_ENABLE_SM100)
     if (h_q == 64) {
         SparseFwd_Sm100_Head64_Impl fwd_impl;
         fwd_impl.run(params, required_features);

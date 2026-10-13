@@ -13,11 +13,18 @@ class Platform(enum.Enum):
 @functools.lru_cache(maxsize=1)
 def get_current_platform() -> Platform:
     """
-    Get the current platform via `lspci`
+    Get the current platform via the device nodes of the drivers, then `lspci`
     """
     if os.path.exists("/dev/davinci_manager"):
         return Platform.ASCEND
-    output = subprocess.check_output(["lspci"], text=True)
+    # A loaded NVIDIA driver. This also covers containers that ship without `lspci`, and GeForce
+    # cards, which `lspci` lists as "VGA compatible controller" rather than "3D controller".
+    if os.path.exists("/dev/nvidiactl"):
+        return Platform.CUDA
+    try:
+        output = subprocess.check_output(["lspci"], text=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return Platform.CPU_ONLY
     if "3D controller: NVIDIA Corporation Device" in output:
         return Platform.CUDA
     return Platform.CPU_ONLY
