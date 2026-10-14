@@ -33,6 +33,9 @@ Conventions (each one of these makes the numbers meaningless if wrong)
     consecutive slices of 64 tokens, i.e. the decode kernels for any T and h; its kernel time is the
     sum over the slices and its wall span also contains the CPU gaps between the launches.
 
+`--small` adds 24 small-batch shapes (b in {1, 4, 16} x s_q in {1, 4} x h in {64, 128} x extra FP8 / FP4, T <= 64), where the
+wrapper calls FlashInfer's decode kernel directly; run it once with the default precision and once with `--precision bf16`.
+
 Error definitions are those of `kk.check_is_allclose`: abs = |ans - ref|, rel = abs / (|ref| + 1e-6),
 cos_diff = 1 - 2 <ans, ref> / (|ans|^2 + |ref|^2); an element passes if abs < abs_tol or rel < rel_tol.
 Tolerances are those of the upstream test: out abs 1e-3 / rel 2.01/128 / cos 5e-6; lse abs 1e-6 /
@@ -86,7 +89,7 @@ FP8, FP4 = quant.KVCacheLayout.V41_FP8Sparse, quant.KVCacheLayout.V41_FP4Sparse
 @dataclasses.dataclass
 class Case:
     name: str
-    group: str      # "production" | "feature"
+    group: str      # "production" | "small" | "feature"
     raw: RawTestParam
 
 
@@ -99,6 +102,22 @@ def production_cases() -> List[Case]:
                 raw = RawTestParam(b, h, 4, 1, 256, True, topk=128, d_qk=512, extra_s_k=2048, extra_topk=512,
                                    block_size=256, extra_block_size=64, kvcache_layout=FP8, extra_kvcache_layout=extra_layout)
                 cases.append(Case(f"h{h}_b{b}_{'fp4' if extra_layout else 'fp8'}", "production", raw))
+    return cases
+
+
+def small_cases() -> List[Case]:
+    """Small batches, T = b * s_q <= 64 so the wrapper takes FlashInfer's decode kernel (its design range): b in {1, 4, 16} x
+    s_q in {1, 4} x h in {64, 128}, topk 128 + extra 512, FP8 / FP4 extra cache, production page sizes, every request with
+    its full 256 / 2048 tokens. The same list (names and data parameters) as `small_cases` of bench_decode_graph.py, so the
+    two scripts time the same shapes."""
+    cases = []
+    for extra_layout in (None, FP4):
+        for h in (64, 128):
+            for s_q in (1, 4):
+                for b in (1, 4, 16):
+                    raw = RawTestParam(b, h, s_q, 1, 256, False, topk=128, d_qk=512, extra_s_k=2048, extra_topk=512,
+                                       block_size=256, extra_block_size=64, kvcache_layout=FP8, extra_kvcache_layout=extra_layout)
+                    cases.append(Case(f"h{h}_b{b}_sq{s_q}_{'fp4' if extra_layout else 'fp8'}", "small", raw))
     return cases
 
 
@@ -350,7 +369,7 @@ def run_case(case: Case, seed: int, args) -> List[Dict]:
     t = lib.generate_testcase_for_decode(p)
     x = make_inputs(p, t)
     T = p.decode.b * p.s_q
-    do_time = args.time and (case.group == "production" or args.time_features)
+    do_time = args.time and (case.group in ("production", "small") or args.time_features)
 
     paths = ["default"]
     if args.chunk64 and T > DECODE_MAX_TOKENS:
@@ -451,7 +470,7 @@ def write_markdown(path: str, rows: List[Dict], args, cmd: str):
         "out tolerances abs 1e-3 / rel 2.01/128 / cos 5e-6, lse abs 1e-6 / rel 8.01/65536. LSE compared in FlashInfer's convention (natural log, includes sink).",
         "",
     ]
-    for group in ("production", "feature"):
+    for group in ("production", "small", "feature"):
         g = [r for r in rows if r["group"] == group]
         if not g:
             continue
@@ -476,6 +495,7 @@ def write_markdown(path: str, rows: List[Dict], args, cmd: str):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--production", action="store_true", help="the 16 production shapes (timing + errors)")
+    parser.add_argument("--small", action="store_true", help="the 24 small-batch shapes (T <= 64: FlashInfer's decode kernel; timing + errors)")
     parser.add_argument("--features", action="store_true", help="the 4 small feature shapes (errors only unless --time-features)")
     parser.add_argument("--empty-rows", action="store_true", help="also run 2 shapes whose rows have no valid KV (sentinel check)")
     parser.add_argument("--only", type=str, default=None, help="comma separated substrings; keep the cases whose name contains one of them")
@@ -499,6 +519,8 @@ def main():
     cases: List[Case] = []
     if args.production:
         cases += production_cases()
+    if args.small:
+        cases += small_cases()
     if args.features:
         cases += feature_cases()
     if args.empty_rows:
@@ -507,7 +529,7 @@ def main():
         keys = args.only.split(",")
         cases = [c for c in cases if any(k in c.name for k in keys)]
     if not cases:
-        parser.error("no cases: pass --production, --features and/or --empty-rows (and check --only)")
+        parser.error("no cases: pass --production, --small, --features and/or --empty-rows (and check --only)")
 
     print(f"{torch.cuda.get_device_name(0)}, torch {torch.__version__}, FlashInfer {flashinfer.__version__}, "
           f"{len(cases)} cases, precision {args.precision}, timing {'on' if args.time else 'off'}", flush=True)
