@@ -22,7 +22,8 @@ cache with NUM_TERMS = 1 (EXTRA_FP4, below).
   the main cache in every request. Their QK runs on the fp4 MMA (kind::mxf4nvf4, twice the rate of
   the e4m3 one) with K as stored and Q quantized again, once per request, to FP4_Q_TERMS terms of
   e2m1 with an e4m3 scale per head and 16 dims. For PV the producers round V once to e4m3 on a
-  power-of-two scale per tile and 32 dims, which makes it a rebased tile like the others.
+  power-of-two scale per tile and 32 dims, which makes it a rebased tile like the others; the scale
+  comes from the largest 16-dim scale of the tile (rebase_fp4_tile_part).
 
 The CTA holds one query token and 64 heads, as in the bf16 path (bf16.cu), and walks tiles of B_TOPK
 tokens with 8 consumer warps and 4 producer warps.
@@ -210,9 +211,11 @@ __device__ __forceinline__ void rebase_tile_part(SharedMemoryPlan &plan, uint32_
 }
 
 // The same for a tile of the fp4 cache (rows at FP4_ROW_STRIDE), whose values are e2m1 times an e4m3 scale per 16 dims:
-// per 32-dim group the scale of the tile is the smallest power of two 2^E with amax / 2^E <= 448, amax taken over the
-// valid tokens, and every value is rounded once to e4m3 on it. The product e2m1 * (scale / 2^E) is exact in fp16 down
-// to where e4m3 rounds it to zero anyway.
+// per 32-dim group the scale of the tile is the smallest power of two 2^E with amax / 2^E <= 448, and every value is
+// rounded once to e4m3 on it. amax is 6 (the largest e2m1 magnitude) times the largest scale of the valid tokens: a
+// bound of their magnitudes that the cache writer reaches unless that scale is clamped or subnormal, and one integer
+// max per group instead of a search of the codes of every token. The product e2m1 * (scale / 2^E) is exact in fp16
+// down to where e4m3 rounds it to zero anyway.
 __device__ __forceinline__ void rebase_fp4_tile_part(SharedMemoryPlan &plan, uint32_t raw_idx, uint32_t v_idx, uint32_t tile_idx, int group_begin, int group_end) {
     const int lane_idx = threadIdx.x % 32;
     const bool is_token_valid = (plan.valid_mask[tile_idx % NUM_MASK_BUFS] >> lane_idx) & 1;
@@ -221,34 +224,19 @@ __device__ __forceinline__ void rebase_fp4_tile_part(SharedMemoryPlan &plan, uin
     const uint32_t out_mask = is_token_valid ? 0xffffffffu : 0u;
     #pragma unroll 1
     for (int group = group_begin; group < group_end; ++group) {
-        const uint4 data = *reinterpret_cast<const uint4*>(row + 16 * group);
-        const uint32_t scales = e4m3x2_to_f16x2(*reinterpret_cast<const uint16_t*>(row + Fp4Format::QUANT_BYTES + 2 * group));
-        const float scale[2] = {f16_to_f32(scales), f16_to_f32(scales >> 16)};
-        // amax of the token: the largest magnitude code of each 16 dims (codes order as their magnitudes) times its scale
-        float amax = 0.0f;
-        {
-            uint32_t max_codes[2];
-            #pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                const uint32_t w0 = h == 0 ? data.x : data.z, w1 = h == 0 ? data.y : data.w;
-                uint32_t m = __vmaxu4(__vmaxu4(w0 & 0x07070707u, (w0 >> 4) & 0x07070707u), __vmaxu4(w1 & 0x07070707u, (w1 >> 4) & 0x07070707u));
-                m = __vmaxu4(m, m >> 16);
-                max_codes[h] = __vmaxu4(m, m >> 8) & 0xff;
-            }
-            const uint32_t max_vals = e2m1x2_to_f16x2(max_codes[0] | (max_codes[1] << 4));
-            amax = is_token_valid ? fmaxf(f16_to_f32(max_vals) * scale[0], f16_to_f32(max_vals >> 16) * scale[1]) : 0.0f;
-        }
-        // E = ceil(log2(amax / 448)) as ue8m0: with amax = m * 2^e, m in [1, 2), it is e - 8, or e - 7 if m > 1.75
+        // The e4m3 codes of non-negative values order as the values
+        const uint32_t scale_codes = *reinterpret_cast<const uint16_t*>(row + Fp4Format::QUANT_BYTES + 2 * group);
+        const uint32_t max_code = __reduce_max_sync(0xffffffffu, is_token_valid ? max(scale_codes & 0xffu, scale_codes >> 8) : 0u);
+        const float amax = 6.0f * f16_to_f32(e4m3x2_to_f16x2(max_code));
+        // E = ceil(log2(amax / 448)) as ue8m0: with amax = m * 2^e, m in [1, 2), it is e - 8, or e - 7 if m > 1.75; 2^0 without valid tokens
         const uint32_t amax_bits = __float_as_uint(amax);
-        const uint32_t exponent = amax == 0.0f ? 0u : (amax_bits >> 23) - 8 + ((amax_bits & 0x7fffffu) > 0x600000u ? 1 : 0);
-        uint32_t max_exponent = __reduce_max_sync(0xffffffffu, exponent);
-        max_exponent = max_exponent == 0 ? 127u : max_exponent;     // All zero: 2^0
-        // The factors scale / 2^E, clamped to the fp16 range (only a 16-dim half whose codes are all zero gets there)
+        const uint32_t max_exponent = amax == 0.0f ? 127u : (amax_bits >> 23) - 8 + ((amax_bits & 0x7fffffu) > 0x600000u ? 1 : 0);
+        const uint4 data = *reinterpret_cast<const uint4*>(row + 16 * group);
+        const uint32_t scales = e4m3x2_to_f16x2(scale_codes);
+        const float scale[2] = {f16_to_f32(scales), f16_to_f32(scales >> 16)};
+        // The factors scale / 2^E, at most 448 / 6
         const float inv_pow2 = __uint_as_float((254 - max_exponent) << 23);
-        const __half2 factor[2] = {
-            __float2half2_rn(fminf(scale[0] * inv_pow2, 65504.0f)),
-            __float2half2_rn(fminf(scale[1] * inv_pow2, 65504.0f))
-        };
+        const __half2 factor[2] = {__float2half2_rn(scale[0] * inv_pow2), __float2half2_rn(scale[1] * inv_pow2)};
         #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const uint32_t words[2] = {h == 0 ? data.x : data.z, h == 0 ? data.y : data.w};

@@ -355,18 +355,24 @@ def direct_v_terms(sd: ScopeData, form: str, B: int, lo_shift: int = 4) -> Tuple
     """
     V of a V41_FP4Sparse cache straight to e4m3 on one scale per (block of B tokens, 32 dims), single rounding (the producer of the P3 kernel): v = e2m1 * s16 (exact),
     E = ceil(log2(amax / 448)) with amax over the VALID tokens of the block and the 32 dims, code = e4m3_rn(v / 2^E), SF_B = 2^E. form 'd2' adds a lo term
-    e4m3_rn((v - hi * 2^E) / 2^(E - lo_shift)) on the scale 2^(E - lo_shift). Returns ([codes [bs, T, 512]], [SF_B [bs, T // 32, 512]]) like rebase_v
+    e4m3_rn((v - hi * 2^E) / 2^(E - lo_shift)) on the scale 2^(E - lo_shift). Forms 'd1s' / 'd2s' take amax = 6 * the largest 16-dim scale of the valid tokens instead
+    (an upper bound of their magnitudes, equal to the true amax unless the block with that scale has no code of magnitude 6, which the cache writer only produces for
+    blocks whose scale is clamped or subnormal). Returns ([codes [bs, T, 512]], [SF_B [bs, T // 32, 512]]) like rebase_v
     """
-    assert sd.layout == quant.KVCacheLayout.V41_FP4Sparse and form in ("d1", "d2"), (sd.layout, form)
+    assert sd.layout == quant.KVCacheLayout.V41_FP4Sparse and form in ("d1", "d2", "d1s", "d2s"), (sd.layout, form)
     vals, _, sfv = decode_native(sd)
     bs, T, _ = vals.shape
     nb = T // B
     v = (vals * sfv.repeat_interleave(16, dim=-1)).view(bs, nb, B, 16, 32)             # exact in float32
     vmask = sd.valid.view(bs, nb, B, 1, 1)
-    amax = torch.where(vmask, v.abs(), torch.zeros_like(v)).amax((2, 4))              # [bs, nb, 16]
+    if form.endswith("s"):
+        smax = sfv.view(bs, nb, B, 16, 2).amax(-1)                                     # [bs, nb, B, 16]
+        amax = torch.where(vmask[..., 0], E2M1_MAX * smax, torch.zeros_like(smax)).amax(2)   # [bs, nb, 16], exact (4-bit x 6)
+    else:
+        amax = torch.where(vmask, v.abs(), torch.zeros_like(v)).amax((2, 4))          # [bs, nb, 16]
     E = torch.where(amax > 0, ue8m0_exp(amax / E4M3_MAX, floor_val=None), torch.zeros_like(ue8m0_exp(amax, None)))
     codes, sfbs, r = [], [], v
-    for i in range(1 if form == "d1" else 2):
+    for i in range(1 if form in ("d1", "d1s") else 2):
         Ei = torch.clamp(E - i * lo_shift, min=UE8M0_MIN_EXP)
         sf = pow2f(Ei).view(bs, nb, 1, 16, 1)
         d = e4m3_rn(r / sf)
@@ -386,7 +392,7 @@ class OperandMode:
     k: str = "exact"        # K (QK B operand): exact (bf16, only with q = bf16) | native | k8x1 | k8x2 (fp4 cache converted to e4m3 + ue8m0)
     v: str = "exact"        # V (PV B operand): exact (bf16) | rebase (e4m3 on a common scale per block and 32 dims)
     v8: str = "x1"          # the 8-bit form V is built from when the cache is not MXFP8 already (V41_FP4Sparse): x1 | x2 (per token e4m3 x ue8m0 first, then the rebase: two roundings),
-                            # d1 | d2 (direct: e2m1 x s16 -> e4m3 on the block scale in one rounding, see direct_v_terms)
+                            # d1 | d2 (direct: e2m1 x s16 -> e4m3 on the block scale in one rounding, see direct_v_terms), d1s | d2s (the same with amax = 6 x the largest scale)
     q_src: str = "bf16"     # what Q is quantized from: bf16 (the original Q) | mxfp8x1 (the e4m3 Q the main tile already uses, quantized with the kernel rule and dequantized exactly; only q = nvfp4 / mxfp4 modes)
 
 
@@ -428,7 +434,7 @@ def check_operand_mode(layout, om: OperandMode):
         assert layout == L.V41_MXFP4Sparse and om.k == "native", f"{layout}: {om}"
     assert om.q_src in ("bf16", "mxfp8x1") and (om.q_src == "bf16" or kind in ("nvfp4", "mxfp4"))
     assert om.v in ("exact", "rebase")
-    assert om.v8 in ("x1", "x2", "d1", "d2")
+    assert om.v8 in ("x1", "x2", "d1", "d2", "d1s", "d2s")
     assert om.v8 in ("x1", "x2") or layout == L.V41_FP4Sparse or om.v == "exact", f"{layout}: {om}: the direct V forms exist only for V41_FP4Sparse"
 
 
@@ -454,7 +460,7 @@ def v_terms(sd: ScopeData, om: OperandMode, mode: Mode) -> Tuple[List[torch.Tens
     bs, T, _ = sd.kdeq.shape
     if om.v == "exact":
         return [sd.kdeq.float()], [torch.ones(bs, T // 32, 512, dtype=torch.float32, device=sd.kdeq.device)]
-    if om.v8 in ("d1", "d2"):
+    if om.v8 in ("d1", "d2", "d1s", "d2s"):
         return direct_v_terms(sd, om.v8, mode.B, mode.k_lo_shift)
     terms = eight_bit_terms(sd, om.v8, mode.k_lo_shift)
     vals, sfbs = [], []

@@ -354,6 +354,9 @@ def build_combos() -> List[Tuple[str, str, emu.Mode, Tuple[str, ...]]]:
     for n in (2, 3):
         add(f"p3-mxfp8-nvq{n}-v2", f"as p3-mxfp8-nvq{n} but the V of the fp4 tile as hi + lo e4m3 (d2): the PV of the fp4 tile issues P V_hi and P V_lo (two MMAs instead of one)", HAS_FP4,
             fp8=mx["fp8"], fp4=OM(f"nvfp4x{n}", "native", "rebase", "d2"), p="e4m3x1", **kern)
+    for n in (2, 3):
+        add(f"p3-mxfp8-nvq{n}s", f"as p3-mxfp8-nvq{n} with the V scale from 6 x the largest 16-dim scale of the valid tokens (d1s) instead of their amax", HAS_FP4,
+            fp8=mx["fp8"], fp4=OM(f"nvfp4x{n}", "native", "rebase", "d1s"), p="e4m3x1", **kern)
     add("p3-fp8x2-nvq4pa-v1", "control: main tile = kernel-fp8x2 (Q x2, P x2); fp4 tile: 4 prescaled NVFP4 Q terms, P x2, V one e4m3 term (d1)", HAS_FP4, fp8=x2["fp8"], fp4=nv1(4, "pa"), p="e4m3x2", **kern)
     add("p3-fp8x2-nvq4pa-v2", "control: as p3-fp8x2-nvq4pa-v1 with V as hi + lo (d2); PV issues P_hi V_hi, P_hi V_lo, P_lo V_hi (lo x lo not issued)", HAS_FP4, fp8=x2["fp8"],
         fp4=OM("nvfp4x4pa", "native", "rebase", "d2"), p="e4m3x2", **kern)
@@ -622,7 +625,7 @@ def slow_decode_token(t, mode: emu.Mode, bi: int, si: int) -> Tuple[torch.Tensor
         kterm.append(kt)
         if om.v == "exact":
             vterm.append([kdeq.float()])
-        elif om.v8 in ("d1", "d2"):
+        elif om.v8 in ("d1", "d2", "d1s", "d2s"):
             vterm.append([_slow_fp4_dequant(row)])           # the direct forms work on the block, see the PV loop
         else:
             vterm.append(_slow_token_terms8(layout, row, om.v8, mode.k_lo_shift))
@@ -705,9 +708,9 @@ def slow_decode_token(t, mode: emu.Mode, bi: int, si: int) -> Tuple[torch.Tensor
                 ls = np.float32(tot)
             # --- V terms of the block (rebase per 32 dims over the valid tokens of the block)
             om_blk = mode.ops(toks[n0][0])
-            direct = om_blk.v == "rebase" and om_blk.v8 in ("d1", "d2")
+            direct = om_blk.v == "rebase" and om_blk.v8 in ("d1", "d2", "d1s", "d2s")
             nv = max(len(vterm[n0 + k]) for k in range(B) if valid_arr[n0 + k]) if valid_arr[n0:n0 + B].any() else 1
-            nv = (2 if om_blk.v8 == "d2" else 1) if direct else nv
+            nv = (2 if om_blk.v8 in ("d2", "d2s") else 1) if direct else nv
             vdat = [np.zeros((B, 512)) for _ in range(nv)]       # float64 data
             vsf = [np.ones(512) for _ in range(nv)]              # SF_B per column
             if om_blk.v == "exact":
@@ -718,7 +721,11 @@ def slow_decode_token(t, mode: emu.Mode, bi: int, si: int) -> Tuple[torch.Tensor
                 # e2m1 * s16 straight to e4m3 on the scale 2^E of (this block, 32 dims), E = ceil(log2(amax / 448)) over the valid tokens; d2: the lo term on 2^(E - 4)
                 vk = [k for k in range(B) if valid_arr[n0 + k]]
                 for g in range(16):
-                    amax = max((float(vterm[n0 + k][0][32 * g:32 * g + 32].abs().max()) for k in vk), default=0.0)
+                    if om_blk.v8.endswith("s"):
+                        # 6 x the largest 16-dim scale of the valid tokens
+                        amax = max((6.0 * float(toks[n0 + k][2][256 + 2 * g:256 + 2 * g + 2].view(torch.float8_e4m3fn).float().max()) for k in vk), default=0.0)
+                    else:
+                        amax = max((float(vterm[n0 + k][0][32 * g:32 * g + 32].abs().max()) for k in vk), default=0.0)
                     E = _ceil_log2_py(float(np.float32(amax) / np.float32(448.0))) if amax > 0 else 0
                     for jt in range(nv):
                         vsf[jt][32 * g:32 * g + 32] = 2.0 ** (E - 4 * jt)
@@ -915,6 +922,8 @@ def selftest_framework(verbose: bool = True) -> bool:
         ("fp8+mxfp4", "mxfp8x2 + p bf16 + rebase", emu.Mode(**x2)),
         ("fp8+fp4", "P3 mxfp8 step 1 (3 NVFP4 Q terms with the exponent prescale, V direct d1, B32, kernel Q rules)",
          emu.Mode(fp8=mx["fp8"], fp4=OM("nvfp4x3pe", "native", "rebase", "d1"), p="e4m3x1", B=32, q_kernel_rule=True)),
+        ("fp8+fp4", "P3 mxfp8 kernel (2 NVFP4 Q terms, V direct d1s: the scale from 6 x the largest 16-dim scale, B32, kernel Q rules)",
+         emu.Mode(fp8=mx["fp8"], fp4=OM("nvfp4x2", "native", "rebase", "d1s"), p="e4m3x1", B=32, q_kernel_rule=True)),
         ("fp8+fp4", "P3 fp8x2 control (4 NVFP4 Q terms with the prescale 'pa', V direct hi + lo d2, P x2, B32)",
          emu.Mode(fp8=x2["fp8"], fp4=OM("nvfp4x4pa", "native", "rebase", "d2"), p="e4m3x2", B=32, q_kernel_rule=True)),
         ("fp8+fp4", "P3 q8 source (2 NVFP4 Q terms from the mxfp8x1 Q, prescale 'pe', V d1, B32)",
