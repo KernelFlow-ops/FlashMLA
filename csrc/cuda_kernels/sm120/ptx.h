@@ -78,12 +78,57 @@ __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&frag)[4], uint32_t 
                  : "=r"(frag[0]), "=r"(frag[1]), "=r"(frag[2]), "=r"(frag[3]) : "r"(addr));
 }
 
+// Two 16x16 matrices of bytes, transposed. Lane l supplies the address of row l % 16 of matrix l / 16 (16 bytes,
+// 16-byte aligned). Thread (g, t) gets, in register 2*i + h, the bytes (4t .. 4t+3, 8*h + g) of matrix i: for
+// matrices holding k as rows, the registers {h, 2 + h} are the B fragment of m16n8k32 for the columns [8*h, +8).
+__device__ __forceinline__ void ldmatrix_x2_trans_b8(uint32_t (&frag)[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(frag[0]), "=r"(frag[1]), "=r"(frag[2]), "=r"(frag[3]) : "r"(addr));
+}
+
 // d[16x8] += a[16x16] * b[16x8], bf16 inputs and an fp32 accumulator. Thread (g, t) holds
 // a[i] = A(g + 8*(i&1), 8*(i>>1) + 2t .. +1), b0 / b1 = B(2t .. +1 / 8 + 2t .. +1, g), d[i] = D(g + 8*(i>>1), 2t + (i&1))
 __device__ __forceinline__ void mma_m16n8k16_bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// d[16x8] += (a[16x32] * sa) * (b[32x8] * sb): e4m3 inputs, one power-of-two scale per row of A and per column
+// of B (ue8m0: the byte x means 2^(x - 127)), and an fp32 accumulator. It runs at four times the rate of the
+// bf16 MMA. One byte per element, low byte first: thread (g, t) holds
+// a[i] = A(g + 8*(i&1), 16*(i>>1) + 4t .. +3), b0 / b1 = B(4t .. +3 / 16 + 4t .. +3, g), and d as for bf16.
+// The scales are bytes of the `sfa` / `sfb` registers of the warp: row m takes byte BYTE_A of thread
+// 4*(m%8) + 2*THREAD_A + (m >= 8), column n takes byte BYTE_B of thread 4*n + THREAD_B. THREAD_A is 0 or 1.
+template<int BYTE_A, int THREAD_A, int BYTE_B, int THREAD_B>
+__device__ __forceinline__ void mma_m16n8k32_mxf8(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1, uint32_t sfa, uint32_t sfb) {
+    static constexpr uint16_t byte_a = BYTE_A, thread_a = THREAD_A, byte_b = BYTE_B, thread_b = THREAD_B;
+    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1),
+                   "r"(sfa), "h"(byte_a), "h"(thread_a), "r"(sfb), "h"(byte_b), "h"(thread_b));
+}
+
+// Two fp32 values -> two e4m3 values (`lo` in the low byte), round to nearest, saturating
+__device__ __forceinline__ uint32_t f32x2_to_e4m3x2(float lo, float hi) {
+    uint16_t result;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n" : "=h"(result) : "f"(hi), "f"(lo));
+    return result;
+}
+
+// Two fp16 values (low half first) -> two e4m3 values (low byte first), round to nearest, saturating
+__device__ __forceinline__ uint32_t f16x2_to_e4m3x2(uint32_t f16x2) {
+    uint16_t result;
+    asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;\n" : "=h"(result) : "r"(f16x2));
+    return result;
+}
+
+// Two non-negative fp32 values -> the smallest powers of two not below them, as ue8m0 (`lo` in the low byte)
+__device__ __forceinline__ uint32_t f32x2_to_ue8m0x2_up(float lo, float hi) {
+    uint16_t result;
+    asm("cvt.rp.satfinite.ue8m0x2.f32 %0, %1, %2;\n" : "=h"(result) : "f"(hi), "f"(lo));
+    return result;
 }
 
 // Two e4m3 values (low byte first) -> two fp16 values (low half first), exact

@@ -1,10 +1,33 @@
 #include "kernel.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #include <kerutils/kerutils.cuh>
 
 #include "cuda_kernels/kv_cache_format.h"
 
 namespace sm120::decode::sparse {
+
+enum class Arithmetic {
+    BF16,
+    FP8X2,
+    MXFP8
+};
+
+// Read on every call, so that a process can switch between the modes
+static Arithmetic get_arithmetic() {
+    const char *mode = std::getenv("FLASH_MLA_SM120_DECODE_MODE");
+    if (mode == nullptr || mode[0] == '\0' || std::strcmp(mode, "bf16") == 0) {
+        return Arithmetic::BF16;
+    } else if (std::strcmp(mode, "fp8x2") == 0) {
+        return Arithmetic::FP8X2;
+    } else if (std::strcmp(mode, "mxfp8") == 0) {
+        return Arithmetic::MXFP8;
+    }
+    KU_ASSERT(false, "FLASH_MLA_SM120_DECODE_MODE must be bf16, fp8x2 or mxfp8, got \"%s\"", mode);
+    return Arithmetic::BF16;
+}
 
 void run_sparse_decode(const SparseAttnDecodeParams &params) {
     KU_ASSERT(params.h_q == 64 || params.h_q == 128, "h_q (%d) must be 64 or 128", params.h_q);
@@ -30,7 +53,13 @@ void run_sparse_decode(const SparseAttnDecodeParams &params) {
         check_cache("extra_k_cache", params.extra_kv, params.stride_extra_kv_block, params.stride_extra_kv_row, params.extra_model_type);
     }
 
-    run_bf16(params);
+    const Arithmetic arithmetic = get_arithmetic();
+    const bool is_all_fp8 = params.extra_topk == 0 || params.extra_model_type == ModelType::V41;
+    if (arithmetic == Arithmetic::BF16 || !is_all_fp8) {
+        run_bf16(params);
+    } else {
+        run_mxfp8(params, arithmetic == Arithmetic::FP8X2 ? 2 : 1);
+    }
 }
 
 }
