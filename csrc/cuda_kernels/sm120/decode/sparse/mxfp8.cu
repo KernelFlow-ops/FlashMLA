@@ -24,8 +24,12 @@ cache with NUM_TERMS = 1 (EXTRA_FP4, below).
   e2m1 with an e4m3 scale per head and 16 dims. For PV the producers round V once to e4m3 on a
   power-of-two scale per tile and 32 dims, which makes it a rebased tile like the others.
 
-The CTA layout is that of the bf16 path (bf16.cu): one query token and 64 heads per CTA, tiles of
-B_TOPK tokens, 8 consumer warps and 4 producer warps.
+The CTA holds one query token and 64 heads, as in the bf16 path (bf16.cu), and walks tiles of B_TOPK
+tokens with 8 consumer warps and 4 producer warps.
+- The consumer warps work in pairs, one per block of 16 heads: warps 2m and 2m+1 (on different SM
+  sub-partitions, so that the pairs sharing one drift apart and overlap their softmax with MMAs) each
+  compute S over half of the dims, swap the halves through shared memory, run the same softmax, and keep
+  P in registers as the A fragments of PV, each over half of the output columns.
 - Producer warp 0 gathers: one cp.async.bulk per row into a ring of NUM_RAW_BUFS tiles, as far ahead
   as the ring is free. The copies are serialized (about 90 clock cycles each, whatever their size),
   so issuing a tile keeps a warp busy, and the row indices are loaded one tile before they are used
@@ -50,7 +54,6 @@ static constexpr int NUM_MASK_BUFS = 4;     // A mask lives from the gather of i
 static constexpr int NUM_SCALE_GROUPS = D_V / Fp8Format::QUANT_TILE_SIZE;
 // ldmatrix reads 8 or 16 rows at once: a row stride that is an odd multiple of 16 B spreads them over all banks
 static constexpr int ROW_BYTES = Fp8Format::BYTES_PER_TOKEN;
-static constexpr int P_ROW_BYTES = B_TOPK + 16;
 // P = hi * 2^-2 + lo * 2^-6. Lazy rescaling keeps P <= 2^RESCALE_THRESHOLD, so hi <= 256 fits e4m3 (max 448)
 static constexpr float P_GAIN = 4.0f, P_LO_GAIN = 16.0f;
 static constexpr uint32_t P_SCALE_HI = 0x7d7d7d7du, P_SCALE_LO = 0x79797979u;
@@ -67,18 +70,19 @@ static constexpr int FP4_ROW_STRIDE = FP4_ROW_BYTES + 16;
 #endif
 static constexpr int FP4_Q_TERMS = MLA_SM120_FP4_Q_TERMS;
 
-static_assert(ROW_BYTES % 32 == 16 && P_ROW_BYTES % 32 == 16 && FP4_ROW_STRIDE % 32 == 16 && FP4_ROW_STRIDE <= ROW_BYTES);
+// A consumer warp holds 16 heads x 256 columns of the output: 32 tiles of 8 columns
+static constexpr int NUM_OUT_TILES = D_V / 2 / 8;
+// The named barriers of the consumer pairs: PAIR_BARRIER_BASE + m for the pair of warps 2m and 2m+1
+static constexpr uint32_t PAIR_BARRIER_BASE = 3;
+
+static_assert(ROW_BYTES % 32 == 16 && FP4_ROW_STRIDE % 32 == 16 && FP4_ROW_STRIDE <= ROW_BYTES);
 static_assert(Fp8Format::QUANT_BYTES == D_QK && Fp8Format::QUANT_TILE_SIZE == 32);
 static_assert(Fp4Format::QUANT_BYTES == D_QK / 2 && Fp4Format::QUANT_TILE_SIZE == 16);
 
 struct SharedMemoryPlan {
     alignas(128) uint8_t raw[NUM_RAW_BUFS][B_TOPK * ROW_BYTES];     // Rows as stored: 512 B e4m3 + 16 B ue8m0 (or 256 B e2m1 + 32 B e4m3)
-    alignas(16) uint8_t v[NUM_V_BUFS][B_TOPK * ROW_BYTES];          // Rebased tiles: e4m3 [token][dim]
-    alignas(16) uint8_t p[2][NUM_HEADS * P_ROW_BYTES];              // e4m3 [term][head][token]
-    alignas(16) float s_exchange[NUM_HEADS / 16][32][16];           // QK partial sums of warps 4-7, in fragment layout
-    alignas(16) float softmax_state[NUM_HEADS / 16][32][4];         // Per softmax thread: {max of head g, of head g+8, its share of the sum of head g, of head g+8}
-    float row_scale[NUM_HEADS];                                     // Per head: the factor for the old output (per tile), then the final output scale
-    uint32_t rescale_flags;                                         // One byte per softmax warp: does any of its heads rescale in this tile
+    alignas(16) uint8_t v[NUM_V_BUFS][B_TOPK * ROW_BYTES];          // Rebased tiles: e4m3 [row][dim], token r in row v_row_of_token(r)
+    alignas(16) float4 s_exchange[NUM_CONSUMER_WARPS][4][32];       // Per consumer warp: its half of S of a tile, in fragment layout
     uint32_t valid_mask[NUM_MASK_BUFS];                             // Bit i: token i of the tile is valid
     uint8_t is_fp4_tile[NUM_MASK_BUFS];                             // The tile comes from the fp4 extra cache
     alignas(16) uint8_t v_scale[NUM_V_BUFS][NUM_SCALE_GROUPS];      // ue8m0 of a rebased tile: one per 32 dims
@@ -154,6 +158,12 @@ __device__ __forceinline__ void gather_tile(const SparseAttnDecodeParams &params
     }
 }
 
+// The row of a V buffer that token r of a tile goes to: row 4t + j holds the token of k = 4t + j in the A fragment of
+// P (see softmax_and_pv), i.e. tokens 2t, 2t + 1, 8 + 2t, 9 + 2t for j = 0..3, and the same 16 higher
+__device__ __forceinline__ int v_row_of_token(int r) {
+    return (r & 16) | ((r & 6) << 1) | ((r & 8) >> 2) | (r & 1);
+}
+
 // fp16 bits of 2^-shift, shift >= 0 (0 once it is below the smallest subnormal)
 __device__ __forceinline__ uint32_t f16_pow2_neg(uint32_t shift) {
     return shift <= 14 ? (15 - shift) << 10 : (shift <= 24 ? 1u << (24 - shift) : 0u);
@@ -167,7 +177,7 @@ __device__ __forceinline__ void rebase_tile_part(SharedMemoryPlan &plan, uint32_
     const int lane_idx = threadIdx.x % 32;
     const bool is_token_valid = (plan.valid_mask[tile_idx % NUM_MASK_BUFS] >> lane_idx) & 1;
     const uint8_t *row = plan.raw[raw_idx] + lane_idx * ROW_BYTES;
-    uint8_t *dst = plan.v[v_idx] + lane_idx * ROW_BYTES;
+    uint8_t *dst = plan.v[v_idx] + v_row_of_token(lane_idx) * ROW_BYTES;
     const uint32_t out_mask = is_token_valid ? 0xffffffffu : 0u;
     #pragma unroll 1
     for (int group = group_begin; group < group_end; ++group) {
@@ -207,7 +217,7 @@ __device__ __forceinline__ void rebase_fp4_tile_part(SharedMemoryPlan &plan, uin
     const int lane_idx = threadIdx.x % 32;
     const bool is_token_valid = (plan.valid_mask[tile_idx % NUM_MASK_BUFS] >> lane_idx) & 1;
     const uint8_t *row = plan.raw[raw_idx] + lane_idx * FP4_ROW_STRIDE;
-    uint8_t *dst = plan.v[v_idx] + lane_idx * ROW_BYTES;
+    uint8_t *dst = plan.v[v_idx] + v_row_of_token(lane_idx) * ROW_BYTES;
     const uint32_t out_mask = is_token_valid ? 0xffffffffu : 0u;
     #pragma unroll 1
     for (int group = group_begin; group < group_end; ++group) {
@@ -532,12 +542,12 @@ __device__ __forceinline__ void pv_step(float (&o_acc)[4], const uint32_t (&p_fr
     mma_m16n8k32_mxf8<0, 0, V_SCALE_BYTE, 0>(o_acc, p_frag, v0, v1, p_scale, v_scale);
 }
 
-// QK of a tile of the main cache over this warp's half of the dims: s_acc[n] += S of the heads [16*m_tile, +16) and the
+// QK of a tile of the main cache over this warp's half of the dims: s_acc[n] += S of the 16 heads of its pair and the
 // tokens [8n, +8). The row of an invalid token holds stale bytes; its S is discarded in the softmax.
 template<int NUM_TERMS>
 __device__ __forceinline__ void qk_tile_fp8(const uint8_t *raw, float (&s_acc)[4][4], const uint32_t (&q_frag)[NUM_TERMS][8][4], const uint32_t (&q_scale)[NUM_TERMS]) {
     const int lane_idx = threadIdx.x % 32;
-    const int q_half = threadIdx.x / 32 / 4;
+    const int q_half = threadIdx.x / 32 % 2;
     const int g = lane_idx / 4, t = lane_idx % 4;
     // The scales of this thread's token of the first output tile; read again at every use, which is
     // cheaper than four more registers held through QK
@@ -565,7 +575,7 @@ __device__ __forceinline__ void qk_tile_fp8(const uint8_t *raw, float (&s_acc)[4
 template<int NQ>
 __device__ __forceinline__ void qk_tile_fp4(const uint8_t *raw, float (&s_acc)[4][4], const uint32_t (&q_frag)[NQ][4][4], const uint32_t (&q_scale)[NQ][2]) {
     const int lane_idx = threadIdx.x % 32;
-    const int q_half = threadIdx.x / 32 / 4;
+    const int q_half = threadIdx.x / 32 % 2;
     const int g = lane_idx / 4, t = lane_idx % 4;
     // Thread t of a quad: the scales of MMA t (dims [64t, +64) of this half) of its token
     const uint32_t *k_scales = reinterpret_cast<const uint32_t*>(raw + g * FP4_ROW_STRIDE + Fp4Format::QUANT_BYTES + 16 * q_half + 4 * t);
@@ -586,146 +596,127 @@ __device__ __forceinline__ void qk_tile_fp4(const uint8_t *raw, float (&s_acc)[4
     }
 }
 
-// Everything of a tile after QK, for the consumer warps: the two halves of S meet, the softmax warps update the running
-// max and sum and write P, O is rescaled where the max moved, and O += P V over this warp's 64 output columns.
+// Everything of a tile after QK, for a consumer warp: its half of S and that of its partner meet, the softmax updates
+// the running max and sum of the pair's 16 heads (both warps of a pair do the same, with the same result), O is rescaled
+// where the max moved, and O += P V over this warp's 256 output columns. P never leaves the registers: the S fragments of
+// a thread hold the tokens {8n + 2t, +1} (n = 0..3), which are its A fragment of the PV MMA for the order of k given by
+// v_row_of_token, in which the rebase stores the tokens.
 template<int NUM_TERMS>
 __device__ __forceinline__ void softmax_and_pv(
     const SparseAttnDecodeParams &params, SharedMemoryPlan &plan, uint32_t tile_idx,
-    float (&s_acc)[4][4], float (&o_acc)[4][8][4], float4 *s_exchange, float4 *softmax_state
+    float (&s_acc)[4][4], float (&o_acc)[NUM_OUT_TILES][4], float (&mi)[2], float (&li)[2]
 ) {
     const int warp_idx = threadIdx.x / 32;
     const int lane_idx = threadIdx.x % 32;
-    const int m_tile = warp_idx % 4;
-    const bool is_softmax_warp = warp_idx < 4;
-    const int g = lane_idx / 4, t = lane_idx % 4;
+    const int t = lane_idx % 4;
+    const uint32_t pair_barrier = PAIR_BARRIER_BASE + warp_idx / 2;
 
-    // The two halves of a head block meet in shared memory
-    if (!is_softmax_warp) {
-        #pragma unroll
-        for (int n = 0; n < 4; ++n) {
-            s_exchange[n] = float4{s_acc[n][0], s_acc[n][1], s_acc[n][2], s_acc[n][3]};
-        }
+    // The halves of S meet in shared memory. The first barrier: the partner has read what this warp wrote for the tile
+    // before
+    named_barrier_sync(pair_barrier, 64);
+    #pragma unroll
+    for (int n = 0; n < 4; ++n) {
+        plan.s_exchange[warp_idx][n][lane_idx] = float4{s_acc[n][0], s_acc[n][1], s_acc[n][2], s_acc[n][3]};
     }
-    named_barrier_sync(NamedBarriers::s_exchanged, NUM_CONSUMER_THREADS);
-
-    if (is_softmax_warp) {
+    named_barrier_sync(pair_barrier, 64);
+    {
         // Bit 8n + i: the token of column i of output tile n
         const uint32_t valid_mask = plan.valid_mask[tile_idx % NUM_MASK_BUFS] >> (2 * t);
         #pragma unroll
         for (int n = 0; n < 4; ++n) {
-            const float4 other = s_exchange[n];
+            const float4 other = plan.s_exchange[warp_idx ^ 1][n][lane_idx];
             const float other_vals[4] = {other.x, other.y, other.z, other.w};
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
+                // The same sum in both warps, as addition commutes
                 const float s = (s_acc[n][i] + other_vals[i]) * params.sm_scale_div_log2;
                 s_acc[n][i] = ((valid_mask >> (8 * n + (i & 1))) & 1) ? s : -CUDART_INF_F;
             }
         }
+    }
 
-        const float4 state = *softmax_state;
-        float mi[2] = {state.x, state.y}, li[2] = {state.z, state.w};
-        float scale_for_old[2];
-        bool should_scale_o = false;
+    // P as the A fragments of the PV MMAs: register r holds head g + 8r and k [4t, +4), i.e. its tokens of the output
+    // tiles 0 and 1 of S, register 2 + r the same for k [16 + 4t, +4) and the output tiles 2 and 3
+    uint32_t p_frag[NUM_TERMS][4];
+    float scale_for_old[2];
+    bool should_scale_o = false;
+    #pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        float cur_max = -CUDART_INF_F;
         #pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            float cur_max = -CUDART_INF_F;
-            #pragma unroll
-            for (int n = 0; n < 4; ++n) {
-                cur_max = max(cur_max, max(s_acc[n][2*r], s_acc[n][2*r+1]));
-            }
-            cur_max = max(cur_max, __shfl_xor_sync(0xffffffffu, cur_max, 1));
-            cur_max = max(cur_max, __shfl_xor_sync(0xffffffffu, cur_max, 2));
-            // By this point cur_max and mi[r] are identical among the 4 threads of the head
-            const bool should_scale = cur_max - mi[r] > RESCALE_THRESHOLD;
-            scale_for_old[r] = should_scale ? exp2f(mi[r] - cur_max) : 1.0f;
-            mi[r] = should_scale ? cur_max : mi[r];
-            should_scale_o |= should_scale;
+        for (int n = 0; n < 4; ++n) {
+            cur_max = max(cur_max, max(s_acc[n][2*r], s_acc[n][2*r+1]));
+        }
+        cur_max = max(cur_max, __shfl_xor_sync(0xffffffffu, cur_max, 1));
+        cur_max = max(cur_max, __shfl_xor_sync(0xffffffffu, cur_max, 2));
+        // By this point cur_max and mi[r] are identical among the 4 threads of the head
+        const bool should_scale = cur_max - mi[r] > RESCALE_THRESHOLD;
+        scale_for_old[r] = should_scale ? exp2f(mi[r] - cur_max) : 1.0f;
+        mi[r] = should_scale ? cur_max : mi[r];
+        should_scale_o |= should_scale;
 
-            // The sum uses P before quantization, as the bf16 path does
-            float cur_sum = 0.0f;
-            uint8_t *p_row = plan.p[0] + (16 * m_tile + g + 8 * r) * P_ROW_BYTES + 2 * t;
-            #pragma unroll
-            for (int n = 0; n < 4; ++n) {
-                const float p0 = exp2f(s_acc[n][2*r] - mi[r]), p1 = exp2f(s_acc[n][2*r+1] - mi[r]);
-                cur_sum += p0 + p1;
-                const uint32_t hi = f32x2_to_e4m3x2(p0 * P_GAIN, p1 * P_GAIN);
-                *reinterpret_cast<uint16_t*>(p_row + 8 * n) = hi;
-                if (NUM_TERMS == 2) {
-                    const uint32_t hi_f16x2 = e4m3x2_to_f16x2(hi);
-                    *reinterpret_cast<uint16_t*>(p_row + NUM_HEADS * P_ROW_BYTES + 8 * n) = f32x2_to_e4m3x2(
-                        (p0 * P_GAIN - f16_to_f32(hi_f16x2)) * P_LO_GAIN,
-                        (p1 * P_GAIN - f16_to_f32(hi_f16x2 >> 16)) * P_LO_GAIN
-                    );
-                }
+        // The sum uses P before quantization, as the bf16 path does
+        float cur_sum = 0.0f;
+        uint32_t two[NUM_TERMS][4];
+        #pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            const float p0 = exp2f(s_acc[n][2*r] - mi[r]), p1 = exp2f(s_acc[n][2*r+1] - mi[r]);
+            cur_sum += p0 + p1;
+            two[0][n] = f32x2_to_e4m3x2(p0 * P_GAIN, p1 * P_GAIN);
+            if constexpr (NUM_TERMS == 2) {
+                const uint32_t hi_f16x2 = e4m3x2_to_f16x2(two[0][n]);
+                two[1][n] = f32x2_to_e4m3x2(
+                    (p0 * P_GAIN - f16_to_f32(hi_f16x2)) * P_LO_GAIN,
+                    (p1 * P_GAIN - f16_to_f32(hi_f16x2 >> 16)) * P_LO_GAIN
+                );
             }
-            li[r] = li[r] * scale_for_old[r] + cur_sum;
         }
-        *softmax_state = float4{mi[0], mi[1], li[0], li[1]};
-        if (t == 0) {
-            plan.row_scale[16 * m_tile + g] = scale_for_old[0];
-            plan.row_scale[16 * m_tile + g + 8] = scale_for_old[1];
-        }
-        const bool any_should_scale_o = __any_sync(0xffffffffu, should_scale_o);
-        if (lane_idx == 0) {
-            reinterpret_cast<uint8_t*>(&plan.rescale_flags)[m_tile] = any_should_scale_o;
+        li[r] = li[r] * scale_for_old[r] + cur_sum;
+        #pragma unroll
+        for (int term = 0; term < NUM_TERMS; ++term) {
+            p_frag[term][r] = two[term][0] | (two[term][1] << 16);
+            p_frag[term][2 + r] = two[term][2] | (two[term][3] << 16);
         }
     }
-    named_barrier_sync(NamedBarriers::softmax_done, NUM_CONSUMER_THREADS);
 
     // Scale O for the heads whose running max moved
-    if (plan.rescale_flags != 0) {
+    if (__any_sync(0xffffffffu, should_scale_o)) {
         #pragma unroll
-        for (int m = 0; m < 4; ++m) {
-            const float scale0 = plan.row_scale[16 * m + g], scale1 = plan.row_scale[16 * m + g + 8];
-            #pragma unroll
-            for (int n = 0; n < 8; ++n) {
-                o_acc[m][n][0] *= scale0;
-                o_acc[m][n][1] *= scale0;
-                o_acc[m][n][2] *= scale1;
-                o_acc[m][n][3] *= scale1;
-            }
+        for (int j = 0; j < NUM_OUT_TILES; ++j) {
+            o_acc[j][0] *= scale_for_old[0];
+            o_acc[j][1] *= scale_for_old[0];
+            o_acc[j][2] *= scale_for_old[1];
+            o_acc[j][3] *= scale_for_old[1];
         }
     }
 
-    // PV: O[head][dim] over this warp's 64 output columns, two head blocks and one term of P at a time to bound
-    // the registers that hold P; V is read once per pass, which the tensor pipe hides (one load per 4 MMAs)
+    // PV: O[head][dim] over this warp's 256 output columns, one ldmatrix (32 tokens x 16 dims) per two output tiles
     const uint32_t v_idx = tile_idx % NUM_V_BUFS;
     {
         const uint32_t round = __umulhi(tile_idx, 0xaaaaaaabu) >> 1;
         mbarrier_wait(&plan.bar_rebased[tile_idx - NUM_RAW_BUFS * round], round & 1);
     }
     {
-        // The two 32-dim groups of this warp's columns: bytes 0 and 1
-        const uint32_t v_scale = *reinterpret_cast<const uint16_t*>(plan.v_scale[v_idx] + 2 * warp_idx);
-        // P: lane l addresses row 8*((l/8)&1) + l%8 and tokens [16*(l/16), +16) of a head block
-        const uint32_t p_base = smem_addr(plan.p[0]) + (((lane_idx / 8) & 1) * 8 + lane_idx % 8) * P_ROW_BYTES + (lane_idx / 16) * 16;
-        // V: lane l addresses token l
-        const uint32_t v_base = smem_addr(plan.v[v_idx]) + lane_idx * ROW_BYTES + warp_idx * 64;
+        // The scales of this warp's 8 32-dim groups, 4 per register; every thread holds them all
+        const uint2 v_scales = *reinterpret_cast<const uint2*>(plan.v_scale[v_idx] + 8 * (warp_idx % 2));
+        // V: lane l addresses row l
+        const uint32_t v_base = smem_addr(plan.v[v_idx]) + lane_idx * ROW_BYTES + (warp_idx % 2) * (D_V / 2);
         #pragma unroll
-        for (int m_pair = 0; m_pair < 2; ++m_pair) {
+        for (int c = 0; c < NUM_OUT_TILES / 2; ++c) {
+            uint32_t v_frag[4];
+            ldmatrix_x2_trans_b8(v_frag, v_base + 16 * c);
+            const uint32_t v_scale = c < NUM_OUT_TILES / 4 ? v_scales.x : v_scales.y;
             #pragma unroll
-            for (int term = 0; term < NUM_TERMS; ++term) {
-                const uint32_t p_scale = term == 0 ? P_SCALE_HI : P_SCALE_LO;
-                uint32_t p_frag[2][4];
+            for (int h = 0; h < 2; ++h) {
                 #pragma unroll
-                for (int m = 0; m < 2; ++m) {
-                    ldmatrix_x4(p_frag[m], p_base + term * (NUM_HEADS * P_ROW_BYTES) + (2 * m_pair + m) * (16 * P_ROW_BYTES));
-                }
-                #pragma unroll
-                for (int n = 0; n < 4; ++n) {
-                    // 32 tokens x 16 dims, i.e. the B fragments of two output tiles, each used by both head blocks
-                    uint32_t v_frag[4];
-                    ldmatrix_x2_trans_b8(v_frag, v_base + n * 16);
-                    #pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        #pragma unroll
-                        for (int m = 0; m < 2; ++m) {
-                            if (n < 2) {
-                                pv_step<0>(o_acc[2 * m_pair + m][2 * n + h], p_frag[m], v_frag[h], v_frag[2 + h], p_scale, v_scale);
-                            } else {
-                                pv_step<1>(o_acc[2 * m_pair + m][2 * n + h], p_frag[m], v_frag[h], v_frag[2 + h], p_scale, v_scale);
-                            }
-                        }
+                for (int term = 0; term < NUM_TERMS; ++term) {
+                    const uint32_t p_scale = term == 0 ? P_SCALE_HI : P_SCALE_LO;
+                    // The columns [16c, +16) are in the 32-dim group c / 2 of the warp: byte (c / 2) % 4 of its register
+                    switch ((c / 2) % 4) {
+                        case 0: pv_step<0>(o_acc[2 * c + h], p_frag[term], v_frag[h], v_frag[2 + h], p_scale, v_scale); break;
+                        case 1: pv_step<1>(o_acc[2 * c + h], p_frag[term], v_frag[h], v_frag[2 + h], p_scale, v_scale); break;
+                        case 2: pv_step<2>(o_acc[2 * c + h], p_frag[term], v_frag[h], v_frag[2 + h], p_scale, v_scale); break;
+                        default: pv_step<3>(o_acc[2 * c + h], p_frag[term], v_frag[h], v_frag[2 + h], p_scale, v_scale); break;
                     }
                 }
             }
@@ -738,24 +729,20 @@ __device__ __forceinline__ void softmax_and_pv(
 
 // The start of a request, for the consumer warps: O = 0, and no max and no sum yet. After Q has been quantized,
 // which leaves the quantization more registers.
-__device__ __forceinline__ void start_request(float (&o_acc)[4][8][4], float4 *softmax_state) {
+__device__ __forceinline__ void start_request(float (&o_acc)[NUM_OUT_TILES][4], float (&mi)[2], float (&li)[2]) {
     #pragma unroll
-    for (int m = 0; m < 4; ++m) {
-        #pragma unroll
-        for (int n = 0; n < 8; ++n) {
-            o_acc[m][n][0] = o_acc[m][n][1] = o_acc[m][n][2] = o_acc[m][n][3] = 0.0f;
-        }
+    for (int j = 0; j < NUM_OUT_TILES; ++j) {
+        o_acc[j][0] = o_acc[j][1] = o_acc[j][2] = o_acc[j][3] = 0.0f;
     }
-    if (threadIdx.x / 32 < 4) {
-        *softmax_state = float4{MAX_INIT_VAL, MAX_INIT_VAL, 0.0f, 0.0f};
-    }
+    mi[0] = mi[1] = MAX_INIT_VAL;
+    li[0] = li[1] = 0.0f;
 }
 
 // One tile of the main cache (QK_FP4 = false) or of the fp4 extra cache, for the consumer warps
 template<int NUM_TERMS, bool QK_FP4, typename QFrag, typename QScale>
 __device__ __forceinline__ void consume_tile(
     const SparseAttnDecodeParams &params, SharedMemoryPlan &plan, uint32_t tile_idx, const QFrag &q_frag, const QScale &q_scale,
-    float (&o_acc)[4][8][4], float4 *s_exchange, float4 *softmax_state
+    float (&o_acc)[NUM_OUT_TILES][4], float (&mi)[2], float (&li)[2]
 ) {
     // Raw buffer and barrier phase of the tile; one multiply instead of a division, as registers are short here
     const uint32_t buf_round = __umulhi(tile_idx, 0xaaaaaaabu) >> 1;
@@ -776,7 +763,74 @@ __device__ __forceinline__ void consume_tile(
     if (threadIdx.x % 32 == 0) {
         mbarrier_arrive(&plan.bar_qk_done[buf_idx]);
     }
-    softmax_and_pv<NUM_TERMS>(params, plan, tile_idx, s_acc, o_acc, s_exchange, softmax_state);
+    softmax_and_pv<NUM_TERMS>(params, plan, tile_idx, s_acc, o_acc, mi, li);
+}
+
+// The end of a request, for a consumer warp: turns the softmax state of its heads into the output scale and the LSE,
+// then scales and stores its 16 heads x 256 columns of the output. `mi` / `li`: the max of the heads g and g+8 and this
+// thread's share of their sums. The first warp of a pair writes the LSE.
+__device__ __forceinline__ void finish_request(
+    const SparseAttnDecodeParams &params, int partition_idx, int batch_idx, const float (&mi)[2], const float (&li)[2],
+    const float (&o_acc)[NUM_OUT_TILES][4]
+) {
+    const int s_q_idx = cta_s_q_idx();
+    const int warp_idx = threadIdx.x / 32;
+    const int lane_idx = threadIdx.x % 32;
+    const int g = lane_idx / 4, t = lane_idx % 4;
+    const int head = cta_head_block() * NUM_HEADS + 16 * (warp_idx / 2) + g;   // Of row g; row g+8 is head + 8
+    const bool writes_lse = warp_idx % 2 == 0 && t == 0;
+
+    const Request req = get_request(params, partition_idx, batch_idx);
+    float o_scale[2];
+    #pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        float m = mi[r], l = li[r];
+        l += __shfl_xor_sync(0xffffffffu, l, 1);
+        l += __shfl_xor_sync(0xffffffffu, l, 2);
+        if (m == MAX_INIT_VAL) {
+            // No valid token. We set l to 0 to fit the definition that l := exp(x[i] - m)
+            l = 0.0f;
+            m = -CUDART_INF_F;
+        }
+        const int head_idx = head + 8 * r;
+        if (req.is_no_split) {
+            const float attn_sink = params.attn_sink == nullptr ? -CUDART_INF_F : params.attn_sink[head_idx] * CUDART_L2E_F;
+            o_scale[r] = l == 0.0f ? 0.0f : 1.0f / (l + exp2f(attn_sink - m));
+            float cur_lse = m * CUDART_LN2_F + logf(l);
+            cur_lse = cur_lse == -CUDART_INF_F ? +CUDART_INF_F : cur_lse;
+            if (writes_lse) {
+                params.lse[(int64_t)batch_idx * params.stride_lse_b + (int64_t)s_q_idx * params.stride_lse_s_q + head_idx] = cur_lse;
+            }
+        } else {
+            // Here we leave attn_sink to the combine kernel, otherwise attn_sink will take effect for multiple times
+            o_scale[r] = l == 0.0f ? 0.0f : 1.0f / l;
+            if (writes_lse) {
+                params.lse_accum[(int64_t)req.n_split_idx * params.stride_lse_accum_split + (int64_t)s_q_idx * params.stride_lse_accum_s_q + head_idx] = log2f(l) + m;
+            }
+        }
+    }
+
+    // Scale and store: this thread holds rows g and g+8 and pairs of adjacent columns of every output tile
+    const int col = (warp_idx % 2) * (D_V / 2) + 2 * t;
+    if (req.is_no_split) {
+        bf16 *row0 = params.out + (int64_t)batch_idx * params.stride_o_b + (int64_t)s_q_idx * params.stride_o_s_q
+            + (int64_t)head * params.stride_o_h_q + col;
+        bf16 *row1 = row0 + 8 * (int64_t)params.stride_o_h_q;
+        #pragma unroll
+        for (int j = 0; j < NUM_OUT_TILES; ++j) {
+            *reinterpret_cast<__nv_bfloat162*>(row0 + 8 * j) = __float22bfloat162_rn(float2{o_acc[j][0] * o_scale[0], o_acc[j][1] * o_scale[0]});
+            *reinterpret_cast<__nv_bfloat162*>(row1 + 8 * j) = __float22bfloat162_rn(float2{o_acc[j][2] * o_scale[1], o_acc[j][3] * o_scale[1]});
+        }
+    } else {
+        float *row0 = params.o_accum + (int64_t)req.n_split_idx * params.stride_o_accum_split + (int64_t)s_q_idx * params.stride_o_accum_s_q
+            + (int64_t)head * params.stride_o_accum_h_q + col;
+        float *row1 = row0 + 8 * (int64_t)params.stride_o_accum_h_q;
+        #pragma unroll
+        for (int j = 0; j < NUM_OUT_TILES; ++j) {
+            *reinterpret_cast<float2*>(row0 + 8 * j) = float2{o_acc[j][0] * o_scale[0], o_acc[j][1] * o_scale[0]};
+            *reinterpret_cast<float2*>(row1 + 8 * j) = float2{o_acc[j][2] * o_scale[1], o_acc[j][3] * o_scale[1]};
+        }
+    }
 }
 
 // This thread's first row of Q in a request: head g of its warp's head block, the first of its half of the dims.
@@ -785,23 +839,17 @@ __device__ __forceinline__ const bf16 *q_row(const SparseAttnDecodeParams &param
     const int warp_idx = threadIdx.x / 32;
     const int g = threadIdx.x % 32 / 4;
     return params.q + (int64_t)batch_idx * params.stride_q_b + (int64_t)cta_s_q_idx() * params.stride_q_s_q
-        + (int64_t)(cta_head_block() * NUM_HEADS + 16 * (warp_idx % 4) + g) * params.stride_q_h_q + (D_QK / 2) * (warp_idx / 4);
+        + (int64_t)(cta_head_block() * NUM_HEADS + 16 * (warp_idx / 2) + g) * params.stride_q_h_q + (D_QK / 2) * (warp_idx % 2);
 }
 
 template<int NUM_TERMS, bool EXTRA_FP4>
 __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan) {
     const int partition_idx = cta_partition_idx();
-    const int warp_idx = threadIdx.x / 32;
-    const int lane_idx = threadIdx.x % 32;
-    const int m_tile = warp_idx % 4;    // The heads [16*m_tile, +16) in QK and the softmax
 
     int begin_req_idx, end_req_idx;
     if (!get_request_range(params, partition_idx, begin_req_idx, end_req_idx)) {
         return;
     }
-
-    float4 *s_exchange = reinterpret_cast<float4*>(plan.s_exchange[m_tile][lane_idx]);
-    float4 *softmax_state = reinterpret_cast<float4*>(plan.softmax_state[m_tile][lane_idx]);
 
     uint32_t tile_idx = 0;  // The same count as in producer_main
     #pragma unroll 1
@@ -814,27 +862,28 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
             // The tiles of the main cache come first; with EXTRA_FP4 those of the extra cache are fp4 tiles
             fp8_end_block_idx = EXTRA_FP4 ? min(end_block_idx, req.num_orig_blocks) : end_block_idx;
         }
-        float o_acc[4][8][4];   // [head block][output tile within the 64 columns of this warp]
+        float o_acc[NUM_OUT_TILES][4];  // The output tiles of this warp's 256 columns
+        float mi[2], li[2];             // The softmax state of the heads g and g+8
         if constexpr (!EXTRA_FP4) {
             // Q as the A fragments of the 8 MMAs (k = 32 dims each) of this warp
             uint32_t q_frag[NUM_TERMS][8][4], q_scale[NUM_TERMS];
             quantize_q<NUM_TERMS>(q_row(params, batch_idx), 8 * (int64_t)params.stride_q_h_q, q_frag, q_scale);
-            start_request(o_acc, softmax_state);
+            start_request(o_acc, mi, li);
             #pragma unroll 1
             for (; block_idx < end_block_idx; ++block_idx, ++tile_idx) {
-                consume_tile<NUM_TERMS, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, s_exchange, softmax_state);
+                consume_tile<NUM_TERMS, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
             }
         } else {
             if (block_idx < fp8_end_block_idx) {
                 uint32_t q_frag[NUM_TERMS][8][4], q_scale[NUM_TERMS];
                 quantize_q<NUM_TERMS>(q_row(params, batch_idx), 8 * (int64_t)params.stride_q_h_q, q_frag, q_scale);
-                start_request(o_acc, softmax_state);
+                start_request(o_acc, mi, li);
                 #pragma unroll 1
                 for (; block_idx < fp8_end_block_idx; ++block_idx, ++tile_idx) {
-                    consume_tile<NUM_TERMS, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, s_exchange, softmax_state);
+                    consume_tile<NUM_TERMS, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
                 }
             } else {
-                start_request(o_acc, softmax_state);
+                start_request(o_acc, mi, li);
             }
             if (block_idx < end_block_idx) {
                 // Q again, as the A fragments of the 4 fp4 MMAs (k = 64 dims each) of this warp
@@ -842,12 +891,12 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
                 quantize_q_nvfp4<FP4_Q_TERMS>(q_row(params, batch_idx), 8 * (int64_t)params.stride_q_h_q, q_frag, q_scale);
                 #pragma unroll 1
                 for (; block_idx < end_block_idx; ++block_idx, ++tile_idx) {
-                    consume_tile<NUM_TERMS, true>(params, plan, tile_idx, q_frag, q_scale, o_acc, s_exchange, softmax_state);
+                    consume_tile<NUM_TERMS, true>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
                 }
             }
         }
 
-        finish_request(params, partition_idx, batch_idx, softmax_state, plan.row_scale, o_acc);
+        finish_request(params, partition_idx, batch_idx, mi, li, o_acc);
     }
 }
 
@@ -874,12 +923,13 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
     __syncthreads();
 
     // 256 * 232 + 128 * 40 = 256 * 224 + 128 * 56 = 384 * 168 registers: the split has to stay within what the block
-    // got at launch, or the last warp waits in setmaxnreg.inc for ever. The rebase of fp4 tiles runs faster with 56.
+    // got at launch, or the last warp waits in setmaxnreg.inc for ever. The rebase runs faster with 56; the consumers
+    // with two terms need 232.
     if (threadIdx.x < NUM_CONSUMER_THREADS) {
-        setmaxnreg_inc<EXTRA_FP4 ? 224 : 232>();
+        setmaxnreg_inc<NUM_TERMS == 1 ? 224 : 232>();
         consumer_main<NUM_TERMS, EXTRA_FP4>(params, plan);
     } else {
-        setmaxnreg_dec<EXTRA_FP4 ? 56 : 40>();
+        setmaxnreg_dec<NUM_TERMS == 1 ? 56 : 40>();
         producer_main<EXTRA_FP4>(params, plan);
     }
 }
