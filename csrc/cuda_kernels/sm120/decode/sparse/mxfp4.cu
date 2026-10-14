@@ -45,6 +45,7 @@ static constexpr int SCALE_OFFSET = Mxfp4Format::QUANT_BYTES;
 static constexpr int V_ROW_BYTES = D_V + 16;                        // A row of a rebased tile: 512 B e4m3
 // P = hi * 2^-2 + lo * 2^-6. Lazy rescaling keeps P <= 2^RESCALE_THRESHOLD, so hi <= 256 fits e4m3 (max 448)
 static constexpr float P_GAIN = 4.0f, P_LO_GAIN = 16.0f;
+static constexpr float P_GAIN_LOG2 = 2.0f;     // log2(P_GAIN)
 static constexpr uint32_t P_SCALE_HI = 0x7d7d7d7du, P_SCALE_LO = 0x79797979u;
 // The tile scale of V is 2^(largest scale - V_HEADROOM): the largest value of the tile, 6 * 2^V_HEADROOM, has to fit e4m3
 static constexpr int V_HEADROOM = 6;
@@ -486,8 +487,8 @@ __device__ __forceinline__ void softmax_and_pv(
             const float other_vals[4] = {other.x, other.y, other.z, other.w};
             #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                // The same sum in both warps, as addition commutes
-                const float s = (s_acc[n][i] + other_vals[i]) * params.sm_scale_div_log2;
+                // The same sum in both warps, as addition commutes. The scale is applied in the exponent of P
+                const float s = s_acc[n][i] + other_vals[i];
                 s_acc[n][i] = ((valid_mask >> (8 * n + (i & 1))) & 1) ? s : -CUDART_INF_F;
             }
         }
@@ -507,29 +508,34 @@ __device__ __forceinline__ void softmax_and_pv(
         }
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffffu, cur_max, 1));
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffffu, cur_max, 2));
+        // The max of the scaled logits: the scale is positive and rounding is monotonic
+        cur_max *= params.sm_scale_div_log2;
         // By this point cur_max and mi[r] are identical among the 4 threads of the head
         const bool should_scale = cur_max - mi[r] > RESCALE_THRESHOLD;
         scale_for_old[r] = should_scale ? exp2f(mi[r] - cur_max) : 1.0f;
         mi[r] = should_scale ? cur_max : mi[r];
         should_scale_o |= should_scale;
 
-        // The sum uses P before quantization, as the bf16 path does
+        // P * P_GAIN = 2^(logit * scale - (mi - log2(P_GAIN))), scale and gain in one fma. The sum uses P before quantization, as
+        // the bf16 path does; it is divided by the power of two P_GAIN once, which is exact
+        const float exp_offset = P_GAIN_LOG2 - mi[r];
         float cur_sum = 0.0f;
         uint32_t two[NUM_P_TERMS][4];
         #pragma unroll
         for (int n = 0; n < 4; ++n) {
-            const float p0 = exp2f(s_acc[n][2*r] - mi[r]), p1 = exp2f(s_acc[n][2*r+1] - mi[r]);
+            const float p0 = exp2f(fmaf(s_acc[n][2*r], params.sm_scale_div_log2, exp_offset));
+            const float p1 = exp2f(fmaf(s_acc[n][2*r+1], params.sm_scale_div_log2, exp_offset));
             cur_sum += p0 + p1;
-            two[0][n] = f32x2_to_e4m3x2(p0 * P_GAIN, p1 * P_GAIN);
+            two[0][n] = f32x2_to_e4m3x2(p0, p1);
             if constexpr (NUM_P_TERMS == 2) {
                 const uint32_t hi_f16x2 = e4m3x2_to_f16x2(two[0][n]);
                 two[1][n] = f32x2_to_e4m3x2(
-                    (p0 * P_GAIN - f16_to_f32(hi_f16x2)) * P_LO_GAIN,
-                    (p1 * P_GAIN - f16_to_f32(hi_f16x2 >> 16)) * P_LO_GAIN
+                    (p0 - f16_to_f32(hi_f16x2)) * P_LO_GAIN,
+                    (p1 - f16_to_f32(hi_f16x2 >> 16)) * P_LO_GAIN
                 );
             }
         }
-        li[r] = li[r] * scale_for_old[r] + cur_sum;
+        li[r] = li[r] * scale_for_old[r] + cur_sum * (1.0f / P_GAIN);
         #pragma unroll
         for (int term = 0; term < NUM_P_TERMS; ++term) {
             p_frag[term][r] = two[term][0] | (two[term][1] << 16);
