@@ -310,6 +310,7 @@ class ScopeData:
     valid: torch.Tensor     # [bs, T] bool: index != -1 and below topk_length. Invalid tokens are excluded from everything (logit = -inf, V = 0, no emax)
     raw: torch.Tensor       # [bs, T, bytes_per_token] uint8 cache bytes, zero for invalid tokens
     kdeq: torch.Tensor      # [bs, T, 512] bf16: the exact dequantization the reference uses, zero for invalid tokens
+    gexp: Optional[torch.Tensor] = None     # [bs, T] int32: the second-level exponent g of a two-level V41_FP4Sparse cache (value = e2m1 * s * 2^g, see quant.quantize_k_cache_fp4_2l); None = 0 everywhere
     _cache: dict = dataclasses.field(default_factory=dict)
 
 
@@ -331,7 +332,17 @@ def gather_scope(scope, b: int, s_q: int) -> ScopeData:
     kdeq = torch.nn.functional.pad(kdeq, (0, 0, 0, pad), value=0)
     raw = torch.where(valid.unsqueeze(-1), raw, torch.zeros_like(raw))             # NaN rows of the upstream tests / padding never reach any computation
     kdeq = torch.where(valid.unsqueeze(-1), kdeq, torch.zeros_like(kdeq))
-    return ScopeData(layout, valid, raw, kdeq)
+    gexp = None
+    g = getattr(scope, "fp4_g", 0)          # the second level of a two-level V41_FP4Sparse cache: an int (one per cache tensor) or an int tensor shaped like the token rows of the cache (one per token); 0 = plain V41_FP4Sparse
+    if isinstance(g, torch.Tensor):
+        gexp = g.reshape(-1).index_select(0, flat).view(b * s_q, topk).to(torch.int32)
+        gexp = torch.nn.functional.pad(gexp, (0, pad), value=0)
+    elif int(g) != 0:
+        gexp = torch.full(valid.shape, int(g), dtype=torch.int32, device=valid.device)
+    if gexp is not None:
+        assert layout == quant.KVCacheLayout.V41_FP4Sparse, "a second level exists only for V41_FP4Sparse caches"
+        gexp = torch.where(valid, gexp, torch.zeros_like(gexp))
+    return ScopeData(layout, valid, raw, kdeq, gexp)
 
 
 def _e2m1_from_packed(data: torch.Tensor) -> torch.Tensor:
@@ -341,7 +352,7 @@ def _e2m1_from_packed(data: torch.Tensor) -> torch.Tensor:
 
 
 def decode_native(sd: ScopeData):
-    """Data values and scales as stored: (vals [bs, T, 512] f32, ue8m0 exponents [bs, T, 16] i32 or None, ue4m3 scales [bs, T, 32] f32 or None)"""
+    """Data values and scales as stored: (vals [bs, T, 512] f32, ue8m0 exponents [bs, T, 16] i32 or None, ue4m3 scales [bs, T, 32] f32 or None; for a two-level V41_FP4Sparse cache the scales times 2^g)"""
     if "native" in sd._cache:
         return sd._cache["native"]
     raw = sd.raw
@@ -350,7 +361,10 @@ def decode_native(sd: ScopeData):
     elif sd.layout == quant.KVCacheLayout.V41_MXFP4Sparse:
         r = (_e2m1_from_packed(raw[..., :256]), ue8m0_byte_to_exp(raw[..., 256:272]), None)
     elif sd.layout == quant.KVCacheLayout.V41_FP4Sparse:
-        r = (_e2m1_from_packed(raw[..., :256]), None, raw[..., 256:288].contiguous().view(torch.float8_e4m3fn).float())
+        sf = raw[..., 256:288].contiguous().view(torch.float8_e4m3fn).float()
+        if sd.gexp is not None:
+            sf = sf * pow2f(sd.gexp).unsqueeze(-1)          # the second level 2^g folded into the block scale (exact: the kernel folds it into the logit scale and the rebase tile exponent)
+        r = (_e2m1_from_packed(raw[..., :256]), None, sf)
     else:
         raise NotImplementedError(sd.layout)
     sd._cache["native"] = r

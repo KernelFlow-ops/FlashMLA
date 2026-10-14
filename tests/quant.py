@@ -272,3 +272,135 @@ def abs_indices2indices_in_kvcache(
     indices_in_kvcache[invalid_mask] = -1
 
     return indices_in_kvcache
+
+
+# ----------------------------------------------------------------------------------------------
+# Two-level NVFP4 cache (sm120 phase 6, G1). The bytes are exactly those of V41_FP4Sparse (256 B of e2m1 + 32 B of e4m3 scales, one per 16 dims, 288 B / token); the second level
+# is a power of two G = 2^g kept outside the bytes (one integer per cache tensor, or per token for the storage comparison): value = e2m1 * s * G.
+#   g = ceil(log2(amax / top)) with top = 2688 = 6 * 448 (1536 = 4 * 384 with Four Over Six: the scale amax / 4 may be rounded up and must stay <= 448), so that the largest
+#   block scale s = amax_block / 6 / G fits e4m3. s = e4m3_rule(amax_block / G / 6) clamped to [2^-9, 448]: rule 'rn' = round to nearest (the V41_FP4Sparse writer: with g = 0 the
+#   result is bit for bit that of quantize_k_cache), rule 'ceil' = the smallest e4m3 value with 6 * s >= amax_block / G (no code saturates).
+#   Four Over Six (arXiv 2512.02010): every block is quantized with the scale mapped to 6 and mapped to 4 (amax / 4, codes 0 .. 4 only), the one with the smaller squared error is kept (ties: 6)
+# ----------------------------------------------------------------------------------------------
+FP4_2L_TOP = 2688.0
+FP4_2L_TOP_46 = 1536.0
+
+
+def fp4_2l_choose_g(amax: torch.Tensor, four_six: bool = False) -> torch.Tensor:
+    """g = ceil(log2(amax / top)) as int32 (exact: from the float64 frexp of the quotient); 0 where amax is 0 (or not positive)"""
+    a = amax.double() / (FP4_2L_TOP_46 if four_six else FP4_2L_TOP)
+    pos = a > 0
+    m, e = torch.frexp(torch.where(pos, a, torch.ones_like(a)))
+    g = e.to(torch.int32) - (m == 0.5).to(torch.int32)
+    return torch.where(pos, g, torch.zeros_like(g))
+
+
+def _fp4_2l_pow2(g) -> torch.Tensor:
+    """2^g as float32 (exact) for an int, or an int tensor"""
+    if isinstance(g, torch.Tensor):
+        return torch.ldexp(torch.ones(g.shape, dtype=torch.float32, device=g.device), g.to(torch.int32))
+    return torch.tensor(2.0 ** int(g), dtype=torch.float32)
+
+
+def _fp4_2l_try(x: torch.Tensor, amax: torch.Tensor, G: torch.Tensor, rule: str, qmax: float):
+    """One quantization of the blocks x [..., ntile, 16] (float32) with the scale mapped to qmax (6 or 4): (codes uint8 [..., ntile, 16], scale float8_e4m3fn [..., ntile])"""
+    a = amax / G                                                    # exact (G is a power of two)
+    scale = torch.clamp(a / qmax, 2.0 ** -9, 448.0).to(torch.float8_e4m3fn)
+    if rule == "ceil":
+        s = scale.float()
+        need = (s * qmax < a) & (s < 448.0)                         # the next e4m3 value above (codes of positive e4m3 values are ordered)
+        scale = torch.where(need, (scale.view(torch.uint8) + 1).view(torch.float8_e4m3fn), scale)
+    else:
+        assert rule == "rn", rule
+    scale = torch.where(torch.isinf(amax), torch.full_like(scale, float("nan")), scale)       # a NaN element poisons the whole block, like the V41_FP4Sparse writer
+    normalized = x / (scale.float() * G).unsqueeze(-1)
+    return _quantize_to_e2m1(normalized), scale
+
+
+def quantize_fp4_2l_blocks(x: torch.Tensor, G: torch.Tensor, rule: str = "rn", four_six: bool = False):
+    """
+    x [..., ntile, 16] float32, G float32 broadcastable to [..., ntile] (a power of two) -> (codes uint8 [..., ntile, 16], scale float8_e4m3fn [..., ntile]); value = e2m1(code) * scale * G
+    """
+    amax = torch.nan_to_num(x.abs(), nan=float("inf")).amax(dim=-1)                # A NaN element poisons the whole block
+    c6, s6 = _fp4_2l_try(x, amax, G, rule, 6.0)
+    if not four_six:
+        return c6, s6
+    c4, s4 = _fp4_2l_try(x, amax, G, rule, 4.0)
+    xd = x.double()
+    e6 = (xd - _dequantize_e2m1(c6).double() * (s6.double() * G.double()).unsqueeze(-1)).pow(2).sum(-1)
+    e4 = (xd - _dequantize_e2m1(c4).double() * (s4.double() * G.double()).unsqueeze(-1)).pow(2).sum(-1)
+    pick4 = e4 < e6
+    return torch.where(pick4.unsqueeze(-1), c4, c6), torch.where(pick4, s4, s6)
+
+
+def quantize_k_cache_fp4_2l(
+    input_k_cache: torch.Tensor,    # (num_blocks, block_size, 1, d)
+    rule: str = "rn",
+    four_six: bool = False,
+    granularity: str = "tensor",    # 'tensor': one g for the whole cache (from the amax over all non-NaN elements); 'token': one g per token
+    g=None,                         # tensor granularity only: use this integer instead of choosing it (g = 0, rule 'rn', no Four Over Six: the bytes of quantize_k_cache(.., V41_FP4Sparse))
+):
+    """
+    Two-level NVFP4 quantization of a k-cache. Returns (bytes (num_blocks, block_size, 1, 288) float8_e4m3fn, laid out like quantize_k_cache(.., V41_FP4Sparse), g),
+    g = a python int (tensor granularity) or an int32 tensor (num_blocks, block_size) (token granularity)
+    """
+    assert granularity in ("tensor", "token")
+    layout = KVCacheLayout.V41_FP4Sparse
+    d, d_nope, d_rope, tile_size, num_tiles = layout.get_meta()
+    assert input_k_cache.shape[-1] == d
+    num_blocks, block_size, h_k, _ = input_k_cache.shape
+    assert h_k == 1
+    x_all = input_k_cache.squeeze(2)
+    blocks_per_chunk = max(1, (1 << 26) // (block_size * d))
+    dev = input_k_cache.device
+    if granularity == "tensor":
+        if g is None:
+            amax_t = 0.0
+            for b0 in range(0, num_blocks, blocks_per_chunk):
+                amax_t = max(amax_t, float(torch.nan_to_num(x_all[b0: b0 + blocks_per_chunk].float().abs(), nan=0.0, posinf=0.0).amax()))
+            g = int(fp4_2l_choose_g(torch.tensor(amax_t, dtype=torch.float32), four_six))
+        g = int(g)
+        G_t = _fp4_2l_pow2(g).to(dev)
+        g_out = g
+    else:
+        assert g is None
+        g_out = torch.empty((num_blocks, block_size), dtype=torch.int32, device=dev)
+    result = torch.empty((num_blocks, block_size, layout.get_bytes_per_token()), dtype=torch.float8_e4m3fn, device=dev)
+    result_k_data = result[..., :d // 2].view(torch.uint8)
+    result_k_scale = result[..., d // 2:]
+    for b0 in range(0, num_blocks, blocks_per_chunk):
+        b1 = min(b0 + blocks_per_chunk, num_blocks)
+        n = b1 - b0
+        x = x_all[b0: b1].float()
+        if granularity == "token":
+            amax_tok = torch.nan_to_num(x.abs(), nan=0.0, posinf=0.0).amax(dim=-1)                  # [n, block_size]
+            g_out[b0: b1] = fp4_2l_choose_g(amax_tok, four_six)
+            G_t = _fp4_2l_pow2(g_out[b0: b1]).unsqueeze(-1)                                         # [n, block_size, 1]
+        codes, scale = quantize_fp4_2l_blocks(x.view(n, block_size, num_tiles, tile_size), G_t, rule, four_six)
+        codes = codes.view(n, block_size, d)
+        result_k_data[b0: b1] = codes[..., 0::2] | (codes[..., 1::2] << 4)
+        result_k_scale[b0: b1] = scale
+    return result.view(num_blocks, block_size, 1, -1), g_out
+
+
+def dequantize_k_cache_fp4_2l(quant_k_cache: torch.Tensor, g) -> torch.Tensor:
+    """(num_blocks, block_size, 1, 288) bytes + g (int or int32 tensor (num_blocks, block_size)) -> bf16 (num_blocks, block_size, 1, 512); e2m1 * e4m3 * 2^g is exact in bf16"""
+    d, d_nope, d_rope, tile_size, num_tiles = KVCacheLayout.V41_FP4Sparse.get_meta()
+    num_blocks, block_size, h_k, _ = quant_k_cache.shape
+    q = quant_k_cache.view(num_blocks, block_size, -1)
+    data = q[..., :d // 2].view(torch.uint8)
+    scale = q[..., d // 2:].view(torch.float8_e4m3fn)
+    result = torch.empty((num_blocks, block_size, d), dtype=torch.bfloat16, device=quant_k_cache.device)
+    blocks_per_chunk = max(1, (1 << 26) // (block_size * d))
+    for b0 in range(0, num_blocks, blocks_per_chunk):
+        b1 = min(b0 + blocks_per_chunk, num_blocks)
+        codes = torch.empty((b1 - b0, block_size, d), dtype=torch.uint8, device=quant_k_cache.device)
+        codes[..., 0::2] = data[b0:b1] & 0xF
+        codes[..., 1::2] = data[b0:b1] >> 4
+        values = _dequantize_e2m1(codes).view(b1 - b0, block_size, num_tiles, tile_size)
+        if isinstance(g, torch.Tensor):
+            G = _fp4_2l_pow2(g[b0:b1]).to(values.device).view(b1 - b0, block_size, 1, 1)
+        else:
+            G = _fp4_2l_pow2(g).to(values.device)
+        result[b0:b1] = ((values * scale[b0:b1].to(values.dtype).unsqueeze(-1)) * G).view(b1 - b0, block_size, d).to(torch.bfloat16)
+    return result.view(num_blocks, block_size, 1, d)
