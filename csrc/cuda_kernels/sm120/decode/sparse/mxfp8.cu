@@ -873,13 +873,13 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
     }
     __syncthreads();
 
-    // 256 * 232 + 128 * 40 = 384 * 168 registers: the split has to stay within what the block got at launch,
-    // or the last warp waits in setmaxnreg.inc for ever
+    // 256 * 232 + 128 * 40 = 256 * 224 + 128 * 56 = 384 * 168 registers: the split has to stay within what the block
+    // got at launch, or the last warp waits in setmaxnreg.inc for ever. The rebase of fp4 tiles runs faster with 56.
     if (threadIdx.x < NUM_CONSUMER_THREADS) {
-        setmaxnreg_inc<232>();
+        setmaxnreg_inc<EXTRA_FP4 ? 224 : 232>();
         consumer_main<NUM_TERMS, EXTRA_FP4>(params, plan);
     } else {
-        setmaxnreg_dec<40>();
+        setmaxnreg_dec<EXTRA_FP4 ? 56 : 40>();
         producer_main<EXTRA_FP4>(params, plan);
     }
 }
