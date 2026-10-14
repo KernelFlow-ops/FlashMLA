@@ -62,6 +62,14 @@ __device__ __forceinline__ void bulk_copy_g2s(void *dst, const void *src, uint32
                  :: "r"(smem_addr(dst)), "l"(src), "r"(num_bytes), "r"(smem_addr(bar)) : "memory");
 }
 
+// TMA: 4 rows (r0..r3, from column `col` on, as wide as the box of `map`) of a 2-D tensor into shared memory one
+// after another, completing their bytes on `bar`. `dst` has to be 128 B aligned; a row outside the tensor (e.g. -1)
+// arrives as zeros and its bytes count all the same. `map` is a __grid_constant__ kernel parameter or in global memory.
+__device__ __forceinline__ void tma_gather4(void *dst, const void *map, int col, int r0, int r1, int r2, int r3, uint64_t *bar) {
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4, %5, %6}], [%7];\n"
+                 :: "r"(smem_addr(dst)), "l"(map), "r"(col), "r"(r0), "r"(r1), "r"(r2), "r"(r3), "r"(smem_addr(bar)) : "memory");
+}
+
 // Four 8x8 matrices of 16-bit elements. Lane l supplies the address of row l % 8 of matrix l / 8 (16 bytes,
 // 16-byte aligned). Thread (g = lane / 4, t = lane % 4) gets, in register i, the elements (g, 2t) and (g, 2t+1)
 // of matrix i: the A fragment of m16n8k16 for matrices {rows 0-7, rows 8-15} x {k 0-7, k 8-15}, or two B

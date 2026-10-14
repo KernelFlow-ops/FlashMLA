@@ -31,10 +31,12 @@ tokens with 8 consumer warps and 4 producer warps.
   sub-partitions, so that the pairs sharing one drift apart and overlap their softmax with MMAs) each
   compute S over half of the dims, swap the halves through shared memory, run the same softmax, and keep
   P in registers as the A fragments of PV, each over half of the output columns.
-- Producer warp 0 gathers: one cp.async.bulk per row into a ring of NUM_RAW_BUFS tiles, as far ahead
-  as the ring is free. The copies are serialized (about 90 clock cycles each, whatever their size),
-  so issuing a tile keeps a warp busy, and the row indices are loaded one tile before they are used
-  to keep that load off the path.
+- Producer warp 0 gathers into a ring of NUM_RAW_BUFS tiles, as far ahead as the ring is free. Rows of an
+  fp8 cache come with one TMA tile::gather4 per 4 rows, from a tensor map of the cache built on the
+  host; rows of an fp4 cache (and of an fp8 cache whose block stride is not a whole number of rows)
+  with one cp.async.bulk per row. Bulk copies are serialized at about 90 clock cycles each whatever
+  their size, so a tile of them keeps the warp busy; a gather4 costs about as much for 4 rows. The row
+  indices are loaded one tile before they are used to keep that load off the path.
 - The other three producer warps rebase every tile as soon as it has arrived, into one of two V
   buffers, so that the rebase of a tile does not wait for the PV of the tile before it.
 - A raw buffer is free again when the consumers have finished its QK and the rebase warps its rebase.
@@ -42,6 +44,12 @@ tokens with 8 consumer warps and 4 producer warps.
 I/O: See SparseAttnDecodeParams in csrc/params.h
 */
 #include "common.h"
+
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+#include <cuda.h>
+#include <cudaTypedefs.h>
 
 namespace sm120::decode::sparse {
 namespace mxfp8_path {
@@ -53,7 +61,6 @@ static_assert(NUM_RAW_BUFS == 3, "the consumers divide by 3 with __umulhi");
 static constexpr int NUM_V_BUFS = 2;        // The tile at PV and the next one, so that a rebase does not wait for the PV before it
 static constexpr int NUM_MASK_BUFS = 4;     // A mask lives from the gather of its tile to its softmax: NUM_RAW_BUFS + 1 tiles
 static constexpr int NUM_SCALE_GROUPS = D_V / Fp8Format::QUANT_TILE_SIZE;
-// ldmatrix reads 8 or 16 rows at once: a row stride that is an odd multiple of 16 B spreads them over all banks
 static constexpr int ROW_BYTES = Fp8Format::BYTES_PER_TOKEN;
 // P = hi * 2^-2 + lo * 2^-6. Lazy rescaling keeps P <= 2^RESCALE_THRESHOLD, so hi <= 256 fits e4m3 (max 448)
 static constexpr float P_GAIN = 4.0f, P_LO_GAIN = 16.0f;
@@ -62,7 +69,15 @@ static constexpr uint32_t P_SCALE_HI = 0x7d7d7d7du, P_SCALE_LO = 0x79797979u;
 static constexpr float Q_LO_GAIN = 16.0f;
 static constexpr uint32_t Q_LO_SCALE_STEP = 4;
 
-// The rows of an fp4 tile (288 B) go to the same raw buffers at this stride
+// A raw tile is 8 groups of 4 rows. A gather4 writes its 4 rows one after another to a 128 B aligned address, so a
+// group of fp8 rows takes 4 * 528 B and the 64 B after them are free: those of the first groups of raw buffer 0
+// hold the barriers and the small state of the CTA (RingState, TileState, ScaleState).
+static constexpr int GROUP_ROWS = 4;
+static constexpr int GROUP_STRIDE = 2176;
+static constexpr int GROUP_GAP = GROUP_ROWS * ROW_BYTES;  // Where the free 64 B of a group start
+static constexpr int RAW_BUF_BYTES = B_TOPK / GROUP_ROWS * GROUP_STRIDE;
+// The rows of an fp4 tile (288 B) go to the same groups at this stride, with the odd groups 64 B further: an
+// ldmatrix reads the 8 rows of two groups, which then fall on 8 different 16 B bank positions
 static constexpr int FP4_ROW_BYTES = Fp4Format::BYTES_PER_TOKEN;
 static constexpr int FP4_ROW_STRIDE = FP4_ROW_BYTES + 16;
 // Q of an fp4 tile = the sum of this many e2m1 terms
@@ -76,21 +91,91 @@ static constexpr int NUM_OUT_TILES = D_V / 2 / 8;
 // The named barriers of the consumer pairs: PAIR_BARRIER_BASE + m for the pair of warps 2m and 2m+1
 static constexpr uint32_t PAIR_BARRIER_BASE = 3;
 
-static_assert(ROW_BYTES % 32 == 16 && FP4_ROW_STRIDE % 32 == 16 && FP4_ROW_STRIDE <= ROW_BYTES);
+static_assert(GROUP_STRIDE % 128 == 0 && GROUP_STRIDE - GROUP_GAP == 64);
+static_assert(64 + (GROUP_ROWS - 1) * FP4_ROW_STRIDE + FP4_ROW_BYTES <= GROUP_GAP && FP4_ROW_STRIDE % 32 == 16);
 static_assert(Fp8Format::QUANT_BYTES == D_QK && Fp8Format::QUANT_TILE_SIZE == 32);
 static_assert(Fp4Format::QUANT_BYTES == D_QK / 2 && Fp4Format::QUANT_TILE_SIZE == 16);
 
 struct SharedMemoryPlan {
-    alignas(128) uint8_t raw[NUM_RAW_BUFS][B_TOPK * ROW_BYTES];     // Rows as stored: 512 B e4m3 + 16 B ue8m0 (or 256 B e2m1 + 32 B e4m3)
-    alignas(16) uint8_t v[NUM_V_BUFS][B_TOPK * ROW_BYTES];          // Rebased tiles: e4m3 [row][dim], token r in row v_row_of_token(r)
+    alignas(128) uint8_t raw[NUM_RAW_BUFS][RAW_BUF_BYTES];          // Rows as stored, at raw_row_offset: 512 B e4m3 + 16 B ue8m0 (or, at fp4_row_offset, 256 B e2m1 + 32 B e4m3)
+    alignas(128) uint8_t v[NUM_V_BUFS][B_TOPK * D_V];               // Rebased tiles: e4m3 at v_offset (or v_offset_paired), token r at position v_row_of_token(r)
     alignas(16) float4 s_exchange[NUM_CONSUMER_WARPS][4][32];       // Per consumer warp: its half of S of a tile, in fragment layout
-    uint32_t valid_mask[NUM_MASK_BUFS];                             // Bit i: token i of the tile is valid
-    uint8_t is_fp4_tile[NUM_MASK_BUFS];                             // The tile comes from the fp4 extra cache
-    alignas(16) uint8_t v_scale[NUM_V_BUFS][NUM_SCALE_GROUPS];      // ue8m0 of a rebased tile: one per 32 dims
+};
+static_assert(sizeof(SharedMemoryPlan) <= 99 * 1024);  // The limit of a block on sm120 (it is exactly that)
+
+// The state of the CTA in the gaps of groups 0, 1 and 2 of raw buffer 0, which no copy writes
+struct RingState {
     uint64_t bar_raw[NUM_RAW_BUFS];                                 // The rows of a tile have arrived
     uint64_t bar_qk_done[NUM_RAW_BUFS];                             // The consumers have finished QK on a tile
-    uint64_t bar_rebased[NUM_RAW_BUFS];                             // The rebase warps have written a tile to its V buffer
     uint64_t bar_v_free[NUM_V_BUFS];                                // The consumers have finished PV on a tile
+};
+struct TileState {
+    uint64_t bar_rebased[NUM_RAW_BUFS];                             // The rebase warps have written a tile to its V buffer
+    uint32_t valid_mask[NUM_MASK_BUFS];                             // Bit i: token i of the tile is valid
+    uint8_t is_fp4_tile[NUM_MASK_BUFS];                             // The tile comes from the fp4 extra cache
+};
+struct ScaleState {
+    alignas(16) uint8_t v_scale[NUM_V_BUFS][NUM_SCALE_GROUPS];      // ue8m0 of a rebased tile: one per 32 dims
+};
+static_assert(sizeof(RingState) <= 64 && sizeof(TileState) <= 64 && sizeof(ScaleState) <= 64);
+__device__ __forceinline__ RingState &ring_state(SharedMemoryPlan &plan) { return *reinterpret_cast<RingState*>(plan.raw[0] + GROUP_GAP); }
+__device__ __forceinline__ TileState &tile_state(SharedMemoryPlan &plan) { return *reinterpret_cast<TileState*>(plan.raw[0] + GROUP_STRIDE + GROUP_GAP); }
+__device__ __forceinline__ ScaleState &scale_state(SharedMemoryPlan &plan) { return *reinterpret_cast<ScaleState*>(plan.raw[0] + 2 * GROUP_STRIDE + GROUP_GAP); }
+
+// Where row r of a raw tile starts: fp8 rows, and fp4 rows
+__device__ __forceinline__ int raw_row_offset(int r) {
+    return (r / GROUP_ROWS) * GROUP_STRIDE + (r % GROUP_ROWS) * ROW_BYTES;
+}
+__device__ __forceinline__ int fp4_row_offset(int r) {
+    return (r / GROUP_ROWS) * GROUP_STRIDE + (r / GROUP_ROWS % 2) * 64 + (r % GROUP_ROWS) * FP4_ROW_STRIDE;
+}
+// Rows 8n + r are 2n groups further than row r, in both layouts
+static constexpr int EIGHT_ROWS = 2 * GROUP_STRIDE;
+
+// Two layouts of a V buffer, both with the 16 B chunks XOR-swizzled by row % 8, so that 8 consecutive rows put the
+// same chunk on 8 different bank positions (an ldmatrix reads 8 rows at a time):
+// - rows (mxfp8): row p = the token at position p; chunk c = its dims [16c, +16). v_offset(p, c).
+// - pair rows (fp8x2): 16 pair rows of 1024 B; chunk c of pair row j = the dims [8c, +8) of position j, then the
+//   same of position 16 + j. An ldmatrix then gives the two registers of an MMA B fragment (positions 0..15 and
+//   16..31) next to each other, which saves the register moves before the MMAs; the rebase pays with 8 B stores.
+//   v_offset_paired(p, c).
+__device__ __forceinline__ int v_offset(int p, int c) {
+    return p * D_V + ((c ^ (p % 8)) << 4);
+}
+__device__ __forceinline__ int v_offset_paired(int p, int c) {
+    return (p % 16) * (2 * D_V) + ((c ^ (p % 8)) << 4) + (p / 16) * 8;
+}
+
+// The stores of the rebase for the token at position p of V buffer `buf`: the 16 dims [32 group + 16 i, +16) with
+// i = ii ^ flip. The swizzle only touches the low 3 bits of the chunk, i.e. bits 4..6 of the offset, and the token
+// base (buffer + row, or pair row and half) has bits 4..8 (4..9) clear: the address of a group is the base plus
+// 32 group (64 group) XOR the swizzle bits of ii = 0, one add and one XOR, and ii = 1 flips one more bit (the chunk
+// bit of i), as does the second 8 B chunk of a pair row (chunk bit 0).
+template<bool PAIRED_V>
+struct VStore {
+    uint32_t base, bits;
+    __device__ __forceinline__ VStore(const uint8_t *buf, int p, int flip) {
+        bits = PAIRED_V ? ((2 * flip) ^ (p % 8)) << 4 : (flip ^ (p % 8)) << 4;
+        base = smem_addr(buf) + (PAIRED_V ? (p % 16) * (2 * D_V) + (p / 16) * 8 : p * D_V);
+    }
+    __device__ __forceinline__ void store(int group, int ii, const uint32_t (&vals)[4]) const {
+        if constexpr (PAIRED_V) {
+            const uint32_t addr = (base + ((64 * group) ^ bits)) ^ (32 * ii);
+            asm volatile("st.shared.v2.b32 [%0], {%1, %2};\n" :: "r"(addr), "r"(vals[0]), "r"(vals[1]));
+            asm volatile("st.shared.v2.b32 [%0], {%1, %2};\n" :: "r"(addr ^ 16), "r"(vals[2]), "r"(vals[3]));
+        } else {
+            const uint32_t addr = (base + ((32 * group) ^ bits)) ^ (16 * ii);
+            asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};\n" :: "r"(addr), "r"(vals[0]), "r"(vals[1]), "r"(vals[2]), "r"(vals[3]));
+        }
+    }
+};
+
+// The tensor maps of the fp8 caches for the gather4: a cache as a 2-D tensor [rows][ROW_BYTES / 4] of 32-bit
+// elements, row = block * rows_per_block + index in the block. rows_per_block = 0: no tensor map (an fp4 cache, or
+// a block stride that is not a whole number of rows); its rows are copied one by one.
+struct GatherMaps {
+    CUtensorMap kv, extra_kv;
+    int kv_rows_per_block, extra_rows_per_block;
 };
 
 // The tiles of a CTA in order: the blocks [start, end) of each of its requests
@@ -128,38 +213,60 @@ __device__ __forceinline__ int load_tile_index(const SparseAttnDecodeParams &par
 }
 
 // Start the copies of tile `tile_idx` into its raw buffer. One lane per token.
-// An invalid token is not copied (its row in the cache may hold NaN); its buffer row keeps stale bytes.
+// An invalid token is not read from the cache (its row there may hold NaN): a gather4 gets row -1 for it, outside the
+// tensor, which arrives as zeros, and a group without a valid token is not gathered; a bulk copy skips the token. Its
+// buffer row then holds zeros or stale bytes, whose S is discarded in the softmax.
 template<bool EXTRA_FP4>
-__device__ __forceinline__ void gather_tile(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan, int index, bool is_extra_block, uint32_t raw_idx, uint32_t tile_idx) {
+__device__ __forceinline__ void gather_tile(
+    const SparseAttnDecodeParams &params, const GatherMaps &maps, SharedMemoryPlan &plan, int index, bool is_extra_block, uint32_t raw_idx, uint32_t tile_idx
+) {
     const int lane_idx = threadIdx.x % 32;
     const bool is_token_valid = index != -1;
     const uint32_t valid_mask = __ballot_sync(0xffffffffu, is_token_valid);
     const bool is_fp4 = EXTRA_FP4 && is_extra_block;
     const uint32_t row_bytes = is_fp4 ? FP4_ROW_BYTES : ROW_BYTES;
-    uint64_t *bar = &plan.bar_raw[raw_idx];
-    if (is_token_valid) {
-        const uint32_t page_block_size = is_extra_block ? params.extra_page_block_size : params.page_block_size;
-        const int64_t block_stride = is_extra_block ? params.stride_extra_kv_block : params.stride_kv_block;
-        const uint8_t *cache = reinterpret_cast<const uint8_t*>(is_extra_block ? params.extra_kv : params.kv);
-        const uint32_t page_idx = (uint32_t)index / page_block_size;
-        const uint32_t idx_in_page = (uint32_t)index - page_idx * page_block_size;
-        bulk_copy_g2s(
-            plan.raw[raw_idx] + lane_idx * (is_fp4 ? FP4_ROW_STRIDE : ROW_BYTES),
-            cache + page_idx * block_stride + (int64_t)idx_in_page * row_bytes,
-            row_bytes,
-            bar
-        );
+    uint64_t *bar = &ring_state(plan).bar_raw[raw_idx];
+    const uint32_t page_block_size = is_extra_block ? params.extra_page_block_size : params.page_block_size;
+    const uint32_t page_idx = (uint32_t)index / page_block_size;
+    const uint32_t idx_in_page = (uint32_t)index - page_idx * page_block_size;
+    const int rows_per_block = is_extra_block ? maps.extra_rows_per_block : maps.kv_rows_per_block;
+    uint32_t num_bytes;
+    if (!is_fp4 && rows_per_block > 0) {
+        // Lane g < 8 gathers the group of tokens [4g, +4)
+        const int row = is_token_valid ? (int)(page_idx * rows_per_block + idx_in_page) : -1;
+        const int group = lane_idx % 8;
+        const int r0 = __shfl_sync(0xffffffffu, row, 4 * group), r1 = __shfl_sync(0xffffffffu, row, 4 * group + 1);
+        const int r2 = __shfl_sync(0xffffffffu, row, 4 * group + 2), r3 = __shfl_sync(0xffffffffu, row, 4 * group + 3);
+        // Bit 4g: group g has a valid token
+        uint32_t valid_groups = valid_mask | (valid_mask >> 1);
+        valid_groups = (valid_groups | (valid_groups >> 2)) & 0x11111111u;
+        if (lane_idx < 8 && ((valid_groups >> (4 * group)) & 1)) {
+            tma_gather4(plan.raw[raw_idx] + group * GROUP_STRIDE, is_extra_block ? &maps.extra_kv : &maps.kv, 0, r0, r1, r2, r3, bar);
+        }
+        num_bytes = __popc(valid_groups) * (GROUP_ROWS * ROW_BYTES);
+    } else {
+        if (is_token_valid) {
+            const int64_t block_stride = is_extra_block ? params.stride_extra_kv_block : params.stride_kv_block;
+            const uint8_t *cache = reinterpret_cast<const uint8_t*>(is_extra_block ? params.extra_kv : params.kv);
+            bulk_copy_g2s(
+                plan.raw[raw_idx] + (is_fp4 ? fp4_row_offset(lane_idx) : raw_row_offset(lane_idx)),
+                cache + page_idx * block_stride + (int64_t)idx_in_page * row_bytes,
+                row_bytes,
+                bar
+            );
+        }
+        num_bytes = __popc(valid_mask) * row_bytes;
     }
     if (lane_idx == 0) {
-        plan.valid_mask[tile_idx % NUM_MASK_BUFS] = valid_mask;
+        tile_state(plan).valid_mask[tile_idx % NUM_MASK_BUFS] = valid_mask;
         if (EXTRA_FP4) {
-            plan.is_fp4_tile[tile_idx % NUM_MASK_BUFS] = is_fp4;
+            tile_state(plan).is_fp4_tile[tile_idx % NUM_MASK_BUFS] = is_fp4;
         }
-        mbarrier_arrive_expect_tx(bar, __popc(valid_mask) * row_bytes);
+        mbarrier_arrive_expect_tx(bar, num_bytes);
     }
 }
 
-// The row of a V buffer that token r of a tile goes to: row 4t + j holds the token of k = 4t + j in the A fragment of
+// The position in a V buffer (see v_offset) that token r of a tile goes to: position 4t + j holds the token of k = 4t + j in the A fragment of
 // P (see softmax_and_pv), i.e. tokens 2t, 2t + 1, 8 + 2t, 9 + 2t for j = 0..3, and the same 16 higher
 __device__ __forceinline__ int v_row_of_token(int r) {
     return (r & 16) | ((r & 6) << 1) | ((r & 8) >> 2) | (r & 1);
@@ -174,12 +281,19 @@ __device__ __forceinline__ uint32_t f16_pow2_neg(uint32_t shift) {
 // per group the largest exponent among the valid tokens becomes the scale of the tile, and every token is divided
 // by the power of two that its own scale is below it. Lane = token; an invalid token becomes zeros.
 // The division goes through fp16, where it is exact for shifts up to 15, and back to e4m3 with round to nearest.
+template<bool PAIRED_V>
 __device__ __forceinline__ void rebase_tile_part(SharedMemoryPlan &plan, uint32_t raw_idx, uint32_t v_idx, uint32_t tile_idx, int group_begin, int group_end) {
     const int lane_idx = threadIdx.x % 32;
-    const bool is_token_valid = (plan.valid_mask[tile_idx % NUM_MASK_BUFS] >> lane_idx) & 1;
-    const uint8_t *row = plan.raw[raw_idx] + lane_idx * ROW_BYTES;
-    uint8_t *dst = plan.v[v_idx] + v_row_of_token(lane_idx) * ROW_BYTES;
+    const bool is_token_valid = (tile_state(plan).valid_mask[tile_idx % NUM_MASK_BUFS] >> lane_idx) & 1;
+    const uint8_t *row = plan.raw[raw_idx] + raw_row_offset(lane_idx);
+    const int v_row = v_row_of_token(lane_idx);
+    uint8_t *dst = plan.v[v_idx];
     const uint32_t out_mask = is_token_valid ? 0xffffffffu : 0u;
+    // Rows 4..7 mod 8 take the two halves of a group in the other order: the rows of a group start at the same 4
+    // bank positions in every group, so this spreads one load of the warp over all 8
+    const int half_flip = (lane_idx / GROUP_ROWS) % 2;
+    const VStore<PAIRED_V> v_store(dst, v_row, half_flip);
+    const uint8_t *row_half[2] = {row + 16 * half_flip, row + 16 * (half_flip ^ 1)};
     #pragma unroll 1
     for (int group = group_begin; group < group_end; ++group) {
         const uint32_t exponent = is_token_valid ? row[Fp8Format::QUANT_BYTES + group] : 0u;
@@ -187,8 +301,8 @@ __device__ __forceinline__ void rebase_tile_part(SharedMemoryPlan &plan, uint32_
         const uint32_t factor_bits = f16_pow2_neg(max_exponent - exponent) * 0x00010001u;
         const __half2 factor = *reinterpret_cast<const __half2*>(&factor_bits);
         #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-            const uint4 raw = *reinterpret_cast<const uint4*>(row + 32 * group + 16 * i);
+        for (int ii = 0; ii < 2; ++ii) {
+            const uint4 raw = *reinterpret_cast<const uint4*>(row_half[ii] + 32 * group);
             const uint32_t words[4] = {raw.x, raw.y, raw.z, raw.w};
             uint32_t vals[4];
             #pragma unroll
@@ -202,26 +316,29 @@ __device__ __forceinline__ void rebase_tile_part(SharedMemoryPlan &plan, uint32_
                 }
                 vals[j] = (halves[0] | (halves[1] << 16)) & out_mask;
             }
-            *reinterpret_cast<uint4*>(dst + 32 * group + 16 * i) = uint4{vals[0], vals[1], vals[2], vals[3]};
+            v_store.store(group, ii, vals);
         }
         if (lane_idx == 0) {
-            plan.v_scale[v_idx][group] = max_exponent;
+            scale_state(plan).v_scale[v_idx][group] = max_exponent;
         }
     }
 }
 
-// The same for a tile of the fp4 cache (rows at FP4_ROW_STRIDE), whose values are e2m1 times an e4m3 scale per 16 dims:
+// The same for a tile of the fp4 cache (rows at fp4_row_offset), whose values are e2m1 times an e4m3 scale per 16 dims:
 // per 32-dim group the scale of the tile is the smallest power of two 2^E with amax / 2^E <= 448, and every value is
 // rounded once to e4m3 on it. amax is 6 (the largest e2m1 magnitude) times the largest scale of the valid tokens: a
 // bound of their magnitudes that the cache writer reaches unless that scale is clamped or subnormal, and one integer
 // max per group instead of a search of the codes of every token. The product e2m1 * (scale / 2^E) is exact in fp16
 // down to where e4m3 rounds it to zero anyway.
+template<bool PAIRED_V>
 __device__ __forceinline__ void rebase_fp4_tile_part(SharedMemoryPlan &plan, uint32_t raw_idx, uint32_t v_idx, uint32_t tile_idx, int group_begin, int group_end) {
     const int lane_idx = threadIdx.x % 32;
-    const bool is_token_valid = (plan.valid_mask[tile_idx % NUM_MASK_BUFS] >> lane_idx) & 1;
-    const uint8_t *row = plan.raw[raw_idx] + lane_idx * FP4_ROW_STRIDE;
-    uint8_t *dst = plan.v[v_idx] + v_row_of_token(lane_idx) * ROW_BYTES;
+    const bool is_token_valid = (tile_state(plan).valid_mask[tile_idx % NUM_MASK_BUFS] >> lane_idx) & 1;
+    const uint8_t *row = plan.raw[raw_idx] + fp4_row_offset(lane_idx);
+    const int v_row = v_row_of_token(lane_idx);
+    uint8_t *dst = plan.v[v_idx];
     const uint32_t out_mask = is_token_valid ? 0xffffffffu : 0u;
+    const VStore<PAIRED_V> v_store(dst, v_row, 0);
     #pragma unroll 1
     for (int group = group_begin; group < group_end; ++group) {
         // The e4m3 codes of non-negative values order as the values
@@ -252,16 +369,16 @@ __device__ __forceinline__ void rebase_fp4_tile_part(SharedMemoryPlan &plan, uin
                 }
                 vals[j] = (halves[0] | (halves[1] << 16)) & out_mask;
             }
-            *reinterpret_cast<uint4*>(dst + 32 * group + 16 * h) = uint4{vals[0], vals[1], vals[2], vals[3]};
+            v_store.store(group, h, vals);
         }
         if (lane_idx == 0) {
-            plan.v_scale[v_idx][group] = max_exponent;
+            scale_state(plan).v_scale[v_idx][group] = max_exponent;
         }
     }
 }
 
-template<bool EXTRA_FP4>
-__device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan) {
+template<bool EXTRA_FP4, bool PAIRED_V>
+__device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &params, const GatherMaps &maps, SharedMemoryPlan &plan) {
     const int partition_idx = cta_partition_idx();
     const int warp_idx = threadIdx.x / 32 - NUM_CONSUMER_WARPS;
     const int lane_idx = threadIdx.x % 32;
@@ -283,7 +400,7 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
     }
 
     if (warp_idx == 0) {
-        // The gather warp. Issuing the 32 copies of a tile takes it about 3000 cycles (they are serialized), and the
+        // The gather warp. Issuing the copies of a tile takes it 1500-3000 cycles (they are serialized), and the
         // indices come from memory nobody has touched, so they are loaded one tile ahead of their use.
         TileCursor cursor;
         enter_request(cursor, params, partition_idx, begin_req_idx);
@@ -301,8 +418,8 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
             if (tile_idx >= NUM_RAW_BUFS) {
                 // The last tile of this buffer: the consumers have to be done with its QK and the rebase warps with its rebase.
                 // Its barriers cannot complete again before this tile is gathered, so the phase cannot be missed.
-                mbarrier_wait(&plan.bar_qk_done[raw_idx], raw_phase ^ 1);
-                mbarrier_wait(&plan.bar_rebased[raw_idx], raw_phase ^ 1);
+                mbarrier_wait(&ring_state(plan).bar_qk_done[raw_idx], raw_phase ^ 1);
+                mbarrier_wait(&tile_state(plan).bar_rebased[raw_idx], raw_phase ^ 1);
             }
             const int index = next_index;
             const bool is_extra_block = is_next_extra_block;
@@ -315,7 +432,7 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
                 is_next_extra_block = cursor.block_idx >= cursor.num_orig_blocks;
                 ++cursor.block_idx;
             }
-            gather_tile<EXTRA_FP4>(params, plan, index, is_extra_block, raw_idx, tile_idx);
+            gather_tile<EXTRA_FP4>(params, maps, plan, index, is_extra_block, raw_idx, tile_idx);
             if (++raw_idx == NUM_RAW_BUFS) {
                 raw_idx = 0;
                 raw_phase ^= 1;
@@ -329,18 +446,18 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
         #pragma unroll 1
         for (uint32_t tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
             const uint32_t v_idx = tile_idx % NUM_V_BUFS;
-            mbarrier_wait(&plan.bar_raw[raw_idx], raw_phase);
+            mbarrier_wait(&ring_state(plan).bar_raw[raw_idx], raw_phase);
             if (tile_idx >= NUM_V_BUFS) {
                 // PV of the tile that was in this V buffer; its barrier completes next for this tile's PV
-                mbarrier_wait(&plan.bar_v_free[v_idx], ((tile_idx / NUM_V_BUFS) & 1) ^ 1);
+                mbarrier_wait(&ring_state(plan).bar_v_free[v_idx], ((tile_idx / NUM_V_BUFS) & 1) ^ 1);
             }
-            if (EXTRA_FP4 && plan.is_fp4_tile[tile_idx % NUM_MASK_BUFS]) {
-                rebase_fp4_tile_part(plan, raw_idx, v_idx, tile_idx, group_begin, group_end);
+            if (EXTRA_FP4 && tile_state(plan).is_fp4_tile[tile_idx % NUM_MASK_BUFS]) {
+                rebase_fp4_tile_part<PAIRED_V>(plan, raw_idx, v_idx, tile_idx, group_begin, group_end);
             } else {
-                rebase_tile_part(plan, raw_idx, v_idx, tile_idx, group_begin, group_end);
+                rebase_tile_part<PAIRED_V>(plan, raw_idx, v_idx, tile_idx, group_begin, group_end);
             }
             if (lane_idx == 0) {
-                mbarrier_arrive(&plan.bar_rebased[raw_idx]);
+                mbarrier_arrive(&tile_state(plan).bar_rebased[raw_idx]);
             }
             if (++raw_idx == NUM_RAW_BUFS) {
                 raw_idx = 0;
@@ -539,16 +656,16 @@ __device__ __forceinline__ void qk_tile_fp8(const uint8_t *raw, float (&s_acc)[4
     const int g = lane_idx / 4, t = lane_idx % 4;
     // The scales of this thread's token of the first output tile; read again at every use, which is
     // cheaper than four more registers held through QK
-    const uint32_t *k_scales = reinterpret_cast<const uint32_t*>(raw + g * ROW_BYTES + Fp8Format::QUANT_BYTES + 8 * q_half + 4 * (t & 1));
+    const uint32_t *k_scales = reinterpret_cast<const uint32_t*>(raw + raw_row_offset(g) + Fp8Format::QUANT_BYTES + 8 * q_half + 4 * (t & 1));
     // One ldmatrix: 8 tokens x 64 dims, i.e. the B fragments of two MMAs
-    const uint32_t base = smem_addr(raw) + (lane_idx % 8) * ROW_BYTES + (lane_idx / 8) * 16 + q_half * (D_QK / 2);
+    const uint32_t base = smem_addr(raw) + raw_row_offset(lane_idx % 8) + (lane_idx / 8) * 16 + q_half * (D_QK / 2);
     #pragma unroll
     for (int k = 0; k < 4; ++k) {
         #pragma unroll
         for (int n = 0; n < 4; ++n) {
             uint32_t k_frag[4];
-            ldmatrix_x4(k_frag, base + n * (8 * ROW_BYTES) + k * 64);
-            const uint32_t k_scale = k_scales[n * (8 * ROW_BYTES / 4)];
+            ldmatrix_x4(k_frag, base + n * EIGHT_ROWS + k * 64);
+            const uint32_t k_scale = k_scales[n * (EIGHT_ROWS / 4)];
             switch (k) {
                 case 0: qk_two_steps<0, NUM_TERMS>(s_acc[n], q_frag, q_scale, k_frag, k_scale); break;
                 case 1: qk_two_steps<2, NUM_TERMS>(s_acc[n], q_frag, q_scale, k_frag, k_scale); break;
@@ -559,22 +676,22 @@ __device__ __forceinline__ void qk_tile_fp8(const uint8_t *raw, float (&s_acc)[4
     }
 }
 
-// The same for a tile of the fp4 cache: rows at FP4_ROW_STRIDE, 128 B of e2m1 and 16 B of scales per half of the dims
+// The same for a tile of the fp4 cache: rows at fp4_row_offset, 128 B of e2m1 and 16 B of scales per half of the dims
 template<int NQ>
 __device__ __forceinline__ void qk_tile_fp4(const uint8_t *raw, float (&s_acc)[4][4], const uint32_t (&q_frag)[NQ][4][4], const uint32_t (&q_scale)[NQ][2]) {
     const int lane_idx = threadIdx.x % 32;
     const int q_half = threadIdx.x / 32 % 2;
     const int g = lane_idx / 4, t = lane_idx % 4;
     // Thread t of a quad: the scales of MMA t (dims [64t, +64) of this half) of its token
-    const uint32_t *k_scales = reinterpret_cast<const uint32_t*>(raw + g * FP4_ROW_STRIDE + Fp4Format::QUANT_BYTES + 16 * q_half + 4 * t);
-    const uint32_t base = smem_addr(raw) + (lane_idx % 8) * FP4_ROW_STRIDE + (lane_idx / 8) * 16 + q_half * (D_QK / 4);
+    const uint32_t *k_scales = reinterpret_cast<const uint32_t*>(raw + fp4_row_offset(g) + Fp4Format::QUANT_BYTES + 16 * q_half + 4 * t);
+    const uint32_t base = smem_addr(raw) + fp4_row_offset(lane_idx % 8) + (lane_idx / 8) * 16 + q_half * (D_QK / 4);
     #pragma unroll
     for (int half = 0; half < 2; ++half) {
         #pragma unroll
         for (int n = 0; n < 4; ++n) {
             uint32_t k_frag[4];
-            ldmatrix_x4(k_frag, base + n * (8 * FP4_ROW_STRIDE) + half * 64);
-            const uint32_t k_scale = k_scales[n * (8 * FP4_ROW_STRIDE / 4)];
+            ldmatrix_x4(k_frag, base + n * EIGHT_ROWS + half * 64);
+            const uint32_t k_scale = k_scales[n * (EIGHT_ROWS / 4)];
             if (half == 0) {
                 qk_fp4_two_steps<0, NQ>(s_acc[n], q_frag, q_scale, k_frag, k_scale);
             } else {
@@ -609,7 +726,7 @@ __device__ __forceinline__ void softmax_and_pv(
     named_barrier_sync(pair_barrier, 64);
     {
         // Bit 8n + i: the token of column i of output tile n
-        const uint32_t valid_mask = plan.valid_mask[tile_idx % NUM_MASK_BUFS] >> (2 * t);
+        const uint32_t valid_mask = tile_state(plan).valid_mask[tile_idx % NUM_MASK_BUFS] >> (2 * t);
         #pragma unroll
         for (int n = 0; n < 4; ++n) {
             const float4 other = plan.s_exchange[warp_idx ^ 1][n][lane_idx];
@@ -682,17 +799,29 @@ __device__ __forceinline__ void softmax_and_pv(
     const uint32_t v_idx = tile_idx % NUM_V_BUFS;
     {
         const uint32_t round = __umulhi(tile_idx, 0xaaaaaaabu) >> 1;
-        mbarrier_wait(&plan.bar_rebased[tile_idx - NUM_RAW_BUFS * round], round & 1);
+        mbarrier_wait(&tile_state(plan).bar_rebased[tile_idx - NUM_RAW_BUFS * round], round & 1);
     }
     {
         // The scales of this warp's 8 32-dim groups, 4 per register; every thread holds them all
-        const uint2 v_scales = *reinterpret_cast<const uint2*>(plan.v_scale[v_idx] + 8 * (warp_idx % 2));
-        // V: lane l addresses row l
-        const uint32_t v_base = smem_addr(plan.v[v_idx]) + lane_idx * ROW_BYTES + (warp_idx % 2) * (D_V / 2);
+        const uint2 v_scales = *reinterpret_cast<const uint2*>(scale_state(plan).v_scale[v_idx] + 8 * (warp_idx % 2));
+        // Step c reads the V of the output tiles 2c and 2c + 1 of the warp. The row (pair row) starts have the swizzle
+        // bits 4..6 clear (the buffer is 128 B aligned), so OR places the swizzled chunk, and the steps that share
+        // swizzle bits are 128 B apart, an immediate offset. The order of c does not matter: each c has its own
+        // accumulators.
+        // - rows: lane l addresses row l, chunk 16 * (warp % 2) + c; v_frag {h, 2 + h} is the B fragment of tile 2c + h
+        // - pair rows: lane l addresses pair row l % 16, chunk 32 * (warp % 2) + 2c + l / 16; v_frag {2h, 2h + 1} is
+        //   the B fragment of tile 2c + h
+        constexpr bool PAIRED_V = NUM_TERMS == 2;
+        const uint32_t v_row_base = PAIRED_V
+            ? smem_addr(plan.v[v_idx]) + (lane_idx % 16) * (2 * D_V) + (warp_idx % 2) * D_V
+            : smem_addr(plan.v[v_idx]) + lane_idx * D_V + (warp_idx % 2) * (D_V / 2);
+        const uint32_t v_swizzle = PAIRED_V ? ((lane_idx / 16) ^ (lane_idx % 8)) << 4 : (lane_idx % 8) << 4;
         #pragma unroll
-        for (int c = 0; c < NUM_OUT_TILES / 2; ++c) {
+        for (int cc = 0; cc < NUM_OUT_TILES / 2; ++cc) {
+            const int c = PAIRED_V ? cc / 4 + 4 * (cc % 4) : cc / 2 + 8 * (cc % 2);
             uint32_t v_frag[4];
-            ldmatrix_x2_trans_b8(v_frag, v_base + 16 * c);
+            ldmatrix_x2_trans_b8(v_frag, PAIRED_V ? (v_row_base | (((2 * (c % 4)) << 4) ^ v_swizzle)) + 128 * (c / 4)
+                                                  : (v_row_base | (((c % 8) << 4) ^ v_swizzle)) + 128 * (c / 8));
             const uint32_t v_scale = c < NUM_OUT_TILES / 4 ? v_scales.x : v_scales.y;
             #pragma unroll
             for (int h = 0; h < 2; ++h) {
@@ -701,17 +830,17 @@ __device__ __forceinline__ void softmax_and_pv(
                     const uint32_t p_scale = term == 0 ? P_SCALE_HI : P_SCALE_LO;
                     // The columns [16c, +16) are in the 32-dim group c / 2 of the warp: byte (c / 2) % 4 of its register
                     switch ((c / 2) % 4) {
-                        case 0: pv_step<0>(o_acc[2 * c + h], p_frag[term], v_frag[h], v_frag[2 + h], p_scale, v_scale); break;
-                        case 1: pv_step<1>(o_acc[2 * c + h], p_frag[term], v_frag[h], v_frag[2 + h], p_scale, v_scale); break;
-                        case 2: pv_step<2>(o_acc[2 * c + h], p_frag[term], v_frag[h], v_frag[2 + h], p_scale, v_scale); break;
-                        default: pv_step<3>(o_acc[2 * c + h], p_frag[term], v_frag[h], v_frag[2 + h], p_scale, v_scale); break;
+                        case 0: pv_step<0>(o_acc[2 * c + h], p_frag[term], v_frag[PAIRED_V ? 2 * h : h], v_frag[PAIRED_V ? 2 * h + 1 : 2 + h], p_scale, v_scale); break;
+                        case 1: pv_step<1>(o_acc[2 * c + h], p_frag[term], v_frag[PAIRED_V ? 2 * h : h], v_frag[PAIRED_V ? 2 * h + 1 : 2 + h], p_scale, v_scale); break;
+                        case 2: pv_step<2>(o_acc[2 * c + h], p_frag[term], v_frag[PAIRED_V ? 2 * h : h], v_frag[PAIRED_V ? 2 * h + 1 : 2 + h], p_scale, v_scale); break;
+                        default: pv_step<3>(o_acc[2 * c + h], p_frag[term], v_frag[PAIRED_V ? 2 * h : h], v_frag[PAIRED_V ? 2 * h + 1 : 2 + h], p_scale, v_scale); break;
                     }
                 }
             }
         }
     }
     if (lane_idx == 0) {
-        mbarrier_arrive(&plan.bar_v_free[v_idx]);
+        mbarrier_arrive(&ring_state(plan).bar_v_free[v_idx]);
     }
 }
 
@@ -735,7 +864,7 @@ __device__ __forceinline__ void consume_tile(
     // Raw buffer and barrier phase of the tile; one multiply instead of a division, as registers are short here
     const uint32_t buf_round = __umulhi(tile_idx, 0xaaaaaaabu) >> 1;
     const uint32_t buf_idx = tile_idx - NUM_RAW_BUFS * buf_round;
-    mbarrier_wait(&plan.bar_raw[buf_idx], buf_round & 1);
+    mbarrier_wait(&ring_state(plan).bar_raw[buf_idx], buf_round & 1);
 
     // QK: S[head][token] over this warp's half of the dims
     float s_acc[4][4];
@@ -749,7 +878,7 @@ __device__ __forceinline__ void consume_tile(
         qk_tile_fp8<NUM_TERMS>(plan.raw[buf_idx], s_acc, q_frag, q_scale);
     }
     if (threadIdx.x % 32 == 0) {
-        mbarrier_arrive(&plan.bar_qk_done[buf_idx]);
+        mbarrier_arrive(&ring_state(plan).bar_qk_done[buf_idx]);
     }
     softmax_and_pv<NUM_TERMS>(params, plan, tile_idx, s_acc, o_acc, mi, li);
 }
@@ -891,45 +1020,81 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
 // The name keeps the upstream substring that the benchmark scripts look for
 template<int NUM_TERMS, bool EXTRA_FP4>
 __global__ void __launch_bounds__(NUM_THREADS, 1)
-flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecodeParams params) {
+flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecodeParams params, __grid_constant__ const GatherMaps maps) {
     extern __shared__ __align__(128) char wksp_buf[];
     SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
 
     if (threadIdx.x == 0) {
         #pragma unroll
         for (int i = 0; i < NUM_RAW_BUFS; ++i) {
-            mbarrier_init(&plan.bar_raw[i], 1);
-            mbarrier_init(&plan.bar_qk_done[i], NUM_CONSUMER_WARPS);
-            mbarrier_init(&plan.bar_rebased[i], NUM_REBASE_WARPS);
+            mbarrier_init(&ring_state(plan).bar_raw[i], 1);
+            mbarrier_init(&ring_state(plan).bar_qk_done[i], NUM_CONSUMER_WARPS);
+            mbarrier_init(&tile_state(plan).bar_rebased[i], NUM_REBASE_WARPS);
         }
         #pragma unroll
         for (int i = 0; i < NUM_V_BUFS; ++i) {
-            mbarrier_init(&plan.bar_v_free[i], NUM_CONSUMER_WARPS);
+            mbarrier_init(&ring_state(plan).bar_v_free[i], NUM_CONSUMER_WARPS);
         }
         fence_mbarrier_init();
     }
     __syncthreads();
 
     // 256 * 232 + 128 * 40 = 256 * 224 + 128 * 56 = 384 * 168 registers: the split has to stay within what the block
-    // got at launch, or the last warp waits in setmaxnreg.inc for ever. The rebase runs faster with 56; the consumers
-    // with two terms need 232.
+    // got at launch, or the last warp waits in setmaxnreg.inc for ever. The rebase of fp4 tiles runs faster with 56; the
+    // consumers of fp8 tiles need 232.
     if (threadIdx.x < NUM_CONSUMER_THREADS) {
-        setmaxnreg_inc<NUM_TERMS == 1 ? 224 : 232>();
+        setmaxnreg_inc<EXTRA_FP4 ? 224 : 232>();
         consumer_main<NUM_TERMS, EXTRA_FP4>(params, plan);
     } else {
-        setmaxnreg_dec<NUM_TERMS == 1 ? 56 : 40>();
-        producer_main<EXTRA_FP4>(params, plan);
+        setmaxnreg_dec<EXTRA_FP4 ? 56 : 40>();
+        producer_main<EXTRA_FP4, NUM_TERMS == 2>(params, maps, plan);
     }
+}
+
+// The tensor map of an fp8 cache for the gather4 (see GatherMaps); returns rows_per_block, 0 without a map.
+// FLASH_MLA_SM120_GATHER4=0 turns the gather4 off (one bulk copy per row), for comparisons.
+static int make_gather_map(CUtensorMap &map, const void *cache, int num_blocks, int page_block_size, int64_t block_stride) {
+    const char *env = std::getenv("FLASH_MLA_SM120_GATHER4");
+    if ((env != nullptr && std::strcmp(env, "0") == 0) || num_blocks <= 0 || block_stride % ROW_BYTES != 0) {
+        return 0;
+    }
+    const int64_t rows_per_block = block_stride / ROW_BYTES;
+    const int64_t num_rows = (int64_t)(num_blocks - 1) * rows_per_block + page_block_size;
+    if (rows_per_block < page_block_size || num_rows > INT_MAX) {
+        return 0;
+    }
+    static const PFN_cuTensorMapEncodeTiled_v12000 encode = [] {
+        void *fn = nullptr;
+        cudaDriverEntryPointQueryResult query;
+        const cudaError_t err = cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &fn, 12000, cudaEnableDefault, &query);
+        return err == cudaSuccess && query == cudaDriverEntryPointSuccess ? reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(fn) : nullptr;
+    }();
+    if (encode == nullptr) {
+        return 0;
+    }
+    const cuuint64_t dims[2] = {ROW_BYTES / 4, (cuuint64_t)num_rows};
+    const cuuint64_t strides[1] = {ROW_BYTES};
+    const cuuint32_t box[2] = {ROW_BYTES / 4, 1};
+    const cuuint32_t element_strides[2] = {1, 1};
+    const CUresult res = encode(&map, CU_TENSOR_MAP_DATA_TYPE_UINT32, 2, const_cast<void*>(cache), dims, strides, box, element_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    return res == CUDA_SUCCESS ? (int)rows_per_block : 0;
 }
 
 template<int NUM_TERMS, bool EXTRA_FP4>
 static void launch(const SparseAttnDecodeParams &params) {
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
-    static_assert(smem_size <= 99 * 1024);  // The limit of a block on sm120
+
+    GatherMaps maps;
+    std::memset(&maps, 0, sizeof(maps));
+    maps.kv_rows_per_block = make_gather_map(maps.kv, params.kv, params.num_blocks, params.page_block_size, params.stride_kv_block);
+    if (params.extra_topk > 0 && !EXTRA_FP4) {
+        maps.extra_rows_per_block = make_gather_map(maps.extra_kv, params.extra_kv, params.extra_num_blocks, params.extra_page_block_size, params.stride_extra_kv_block);
+    }
 
     auto kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<NUM_TERMS, EXTRA_FP4>;
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    kernel<<<decode_grid(params), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params);
+    kernel<<<decode_grid(params), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params, maps);
     KU_CHECK_KERNEL_LAUNCH();
 }
 
