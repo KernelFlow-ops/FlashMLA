@@ -15,6 +15,10 @@
 //      of loads in flight per thread, twice the registers)
 //   G  as C, but completion is tracked with cp.async.commit_group / wait_group and the producer arrives
 //      on the barrier itself (the producer is blocked until the tile has landed)
+//   H  one lane of one warp, 8 TMA cp.async.bulk.tensor.2d tile::gather4 (4 rows each) per tile; the
+//      source is a 2-D tensor map [rows][R / 4] of 32-bit elements built on the host
+//   2  (H2) as H, but 8 lanes issue one gather4 each
+//   I  as H, but every group of 4 rows starts at a 128-byte aligned address (the groups are padded)
 // Row lengths: 528 (fp8 cache), 288 (V4.1 fp4 extra cache), 272 (mxfp4 cache).
 //
 // Every launch is checked first: with VERIFY on, the consumers compare each byte of every tile with the
@@ -23,8 +27,10 @@
 // over the CTAs; GB/s is the sum over CTAs of 32 rows per measured tile interval (globaltimer).
 //
 // Build: nvcc -O3 -std=c++17 -gencode arch=compute_120a,code=sm_120a -o gather_tile gather_tile.cu
-// Run:   ./gather_tile <A..G> <row_bytes: 528|288|272> <busy_clk> [reps=7] [tiles_per_cta=256] [profile=0]
+// Run:   ./gather_tile <A..I, 2 = H2> <row_bytes: 528|288|272> <busy_clk> [reps=7] [tiles_per_cta=256] [profile=0] [oob_every=0]
 //        (one configuration per process, so that it can be run under the GPU lock one at a time)
+//        oob_every = n > 0 (H, H2, I only): entry e of the index list with e % n == 0 gets the row coordinate -1,
+//        out of the tensor; the check then expects zeros in that row
 
 #include <algorithm>
 #include <cstdint>
@@ -34,6 +40,8 @@
 #include <random>
 #include <vector>
 #include <cuda_runtime.h>
+#include <cuda.h>
+#include <cudaTypedefs.h>
 
 #define CK(x)                                                                                    \
     do {                                                                                         \
@@ -91,6 +99,12 @@ __device__ __forceinline__ uint4 ldg_v4(const void *p) {
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
     return v;
 }
+// 4 rows of a 2-D tensor (coordinates: column `col`, rows r0..r3) into shared memory, one row after another
+__device__ __forceinline__ void tma_gather4(void *dst, const CUtensorMap *map, int col, int r0, int r1, int r2, int r3, uint64_t *bar) {
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes"
+                 " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];\n"
+                 ::"r"(smem_addr(dst)), "l"(map), "r"(col), "r"(r0), "r"(r1), "r"(r2), "r"(r3), "r"(smem_addr(bar)) : "memory");
+}
 __device__ __forceinline__ unsigned long long globaltimer() {
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(t));
@@ -98,6 +112,8 @@ __device__ __forceinline__ unsigned long long globaltimer() {
 }
 
 struct Params {
+    CUtensorMap map;     // H, H2, I: kv as [num_rows][R / 4] of 32-bit elements, box R / 4 x 1
+    int oob_every;
     const uint8_t *kv;   // [num_rows][R]
     const int *indices;  // [ctas][tiles * TILE]
     int tiles, busy_clk, t_begin, t_end;
@@ -144,16 +160,29 @@ struct Gather {
 
 template <int M>
 __host__ __device__ constexpr uint32_t full_arrivals() {
-    return M == 'A' ? 1 : M == 'B' ? 4 : M == 'D' ? NTHREADS : 128;
+    return M == 'A' || M == 'H' || M == '2' || M == 'I' ? 1 : M == 'B' ? 4 : M == 'D' ? NTHREADS : 128;
 }
 template <int M>
 __host__ __device__ constexpr uint32_t empty_arrivals() {
     return M == 'D' ? NTHREADS / 32 : 8;  // one per consuming warp
 }
 
+// The byte offset of row r in a tile: rows one after another, except for I, where every group of 4 rows starts
+// at a multiple of 128 bytes
+template <int M, int R>
+__host__ __device__ constexpr int group_stride() { return M == 'I' ? (4 * R + 127) / 128 * 128 : 4 * R; }
+template <int M, int R>
+__host__ __device__ constexpr int row_offset(int r) { return (r / 4) * group_stride<M, R>() + (r % 4) * R; }
+template <int M, int R>
+__host__ __device__ constexpr int tile_bytes() { return TILE / 4 * group_stride<M, R>(); }
+// The row coordinate of entry e of the index list for the TMA methods: -1 (out of the tensor) for the rows tested
+// as invalid
+__device__ __forceinline__ int tma_row(const Params &p, int e, int row) { return p.oob_every > 0 && e % p.oob_every == 0 ? -1 : row; }
+
 template <int M, int R, bool VERIFY>
-__global__ void __launch_bounds__(NTHREADS, 1) tile_kernel(const Params p) {
-    constexpr int TB = TILE * R;
+__global__ void __launch_bounds__(NTHREADS, 1) tile_kernel(const __grid_constant__ Params p) {
+    constexpr int TB = tile_bytes<M, R>();
+    constexpr bool TMA = M == 'H' || M == '2' || M == 'I';
     extern __shared__ __align__(128) uint8_t smem[];
     uint64_t *full = reinterpret_cast<uint64_t *>(smem + STAGES * TB);
     uint64_t *empty = full + STAGES;
@@ -184,8 +213,10 @@ __global__ void __launch_bounds__(NTHREADS, 1) tile_kernel(const Params p) {
         if (VERIFY) {
             constexpr int CPR = R / 16, CPT = TILE * CPR;
             for (int c = ctid; c < CPT; c += nc) {
-                const uint4 want = *reinterpret_cast<const uint4 *>(p.kv + size_t(idx[t * TILE + c / CPR]) * R + (c % CPR) * 16);
-                const uint4 got = *reinterpret_cast<const uint4 *>(smem + s * TB + c * 16);
+                const int e = t * TILE + c / CPR;
+                const bool oob = TMA && p.oob_every > 0 && e % p.oob_every == 0;
+                const uint4 want = oob ? make_uint4(0, 0, 0, 0) : *reinterpret_cast<const uint4 *>(p.kv + size_t(idx[e]) * R + (c % CPR) * 16);
+                const uint4 got = *reinterpret_cast<const uint4 *>(smem + s * TB + row_offset<M, R>(c / CPR) + (c % CPR) * 16);
                 if (want.x != got.x || want.y != got.y || want.z != got.z || want.w != got.w) atomicAdd(p.errors, 1u);
             }
         }
@@ -248,6 +279,33 @@ __global__ void __launch_bounds__(NTHREADS, 1) tile_kernel(const Params p) {
             wait_stage_free(t);
             bulk_copy(smem + s * TB + lane * R, p.kv + size_t(cur) * R, R, &full[s]);
             if (lane == 0) mbarrier_arrive_expect_tx(&full[s], TILE * R);
+        }
+    } else if constexpr (TMA) {
+        // One warp (warp 8), lane l holds the row of entry l of the tile. H and I: lane 0 issues the 8 gather4;
+        // H2: lane g issues group g
+        if (warp != 8) return;
+        int next = idx[lane];
+        for (int t = 0; t < p.tiles; ++t) {
+            const int cur = tma_row(p, t * TILE + lane, next);
+            next = idx[(t + 1) * TILE + lane];
+            const int s = t % STAGES;
+            wait_stage_free(t);
+            if (lane == 0) mbarrier_arrive_expect_tx(&full[s], TILE * R);
+            if constexpr (M == '2') {
+                const int g = lane % 8;
+                const int r0 = __shfl_sync(0xffffffffu, cur, 4 * g), r1 = __shfl_sync(0xffffffffu, cur, 4 * g + 1);
+                const int r2 = __shfl_sync(0xffffffffu, cur, 4 * g + 2), r3 = __shfl_sync(0xffffffffu, cur, 4 * g + 3);
+                if (lane < 8) tma_gather4(smem + s * TB + g * group_stride<M, R>(), &p.map, 0, r0, r1, r2, r3, &full[s]);
+            } else {
+                int r[TILE];
+#pragma unroll
+                for (int i = 0; i < TILE; ++i) r[i] = __shfl_sync(0xffffffffu, cur, i);
+                if (lane == 0) {
+#pragma unroll
+                    for (int g = 0; g < 8; ++g)
+                        tma_gather4(smem + s * TB + g * group_stride<M, R>(), &p.map, 0, r[4 * g], r[4 * g + 1], r[4 * g + 2], r[4 * g + 3], &full[s]);
+                }
+            }
         }
     } else if constexpr (M == 'B') {
         // Four warps, 8 rows each (lanes 0-7)
@@ -398,6 +456,9 @@ static void launch(char method, int row_bytes, bool verify, Params p, int ctas) 
         case 'E': launch_rows<'E'>(row_bytes, verify, p, ctas); break;
         case 'F': launch_rows<'F'>(row_bytes, verify, p, ctas); break;
         case 'G': launch_rows<'G'>(row_bytes, verify, p, ctas); break;
+        case 'H': launch_rows<'H'>(row_bytes, verify, p, ctas); break;
+        case '2': launch_rows<'2'>(row_bytes, verify, p, ctas); break;
+        case 'I': launch_rows<'I'>(row_bytes, verify, p, ctas); break;
         default: printf("unknown method %c\n", method); exit(1);
     }
 }
@@ -414,7 +475,7 @@ static std::string smi(const char *query) {
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        printf("usage: %s <A..G> <row_bytes 528|288|272> <busy_clk> [reps=7] [tiles_per_cta=256] [profile=0]\n", argv[0]);
+        printf("usage: %s <A..I, 2 = H2> <row_bytes 528|288|272> <busy_clk> [reps=7] [tiles_per_cta=256] [profile=0] [oob_every=0]\n", argv[0]);
         return 1;
     }
     const char method = argv[1][0];
@@ -422,6 +483,7 @@ int main(int argc, char **argv) {
     const int reps = argc > 4 ? atoi(argv[4]) : 7;
     const int tiles = argc > 5 ? atoi(argv[5]) : 256;
     const int profile = argc > 6 ? atoi(argv[6]) : 0;
+    const int oob_every = argc > 7 ? atoi(argv[7]) : 0;
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
     const int ctas = prop.multiProcessorCount;
@@ -451,7 +513,23 @@ int main(int argc, char **argv) {
     CK(cudaMalloc(&errors, sizeof(unsigned int)));
     CK(cudaMemset(errors, 0, sizeof(unsigned int)));
 
-    Params p{kv, indices_d, tiles, busy, t_begin, t_end, profile, stats, errors};
+    Params p{};
+    p.oob_every = oob_every;
+    p.kv = kv; p.indices = indices_d; p.tiles = tiles; p.busy_clk = busy; p.t_begin = t_begin; p.t_end = t_end;
+    p.profile = profile; p.stats = stats; p.errors = errors;
+    if (method == 'H' || method == '2' || method == 'I') {
+        PFN_cuTensorMapEncodeTiled_v12000 encode = nullptr;
+        cudaDriverEntryPointQueryResult q;
+        CK(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", reinterpret_cast<void **>(&encode), 12000, cudaEnableDefault, &q));
+        if (q != cudaDriverEntryPointSuccess || encode == nullptr) { printf("no cuTensorMapEncodeTiled\n"); return 1; }
+        const cuuint64_t dims[2] = {cuuint64_t(row_bytes / 4), cuuint64_t(num_rows)};
+        const cuuint64_t strides[1] = {cuuint64_t(row_bytes)};
+        const cuuint32_t box[2] = {cuuint32_t(row_bytes / 4), 1};
+        const cuuint32_t estr[2] = {1, 1};
+        const CUresult r = encode(&p.map, CU_TENSOR_MAP_DATA_TYPE_UINT32, 2, kv, dims, strides, box, estr, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                  CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+        if (r != CUDA_SUCCESS) { printf("cuTensorMapEncodeTiled failed: %d\n", int(r)); return 1; }
+    }
 
     // Correctness: every tile of every CTA, byte by byte
     p.indices = indices_d;
@@ -502,10 +580,10 @@ int main(int argc, char **argv) {
     auto mn = [](const std::vector<double> &v) { return *std::min_element(v.begin(), v.end()); };
     auto mx = [](const std::vector<double> &v) { return *std::max_element(v.begin(), v.end()); };
     const double evt_gbps = double(ctas) * tiles * TILE * row_bytes / (med(evt_us) * 1e3);
-    printf("RESULT method=%c row=%d busy=%d ctas=%d tiles=%d reps=%d verify=%s errors=%u distinct_sms=%d | "
+    printf("RESULT method=%c oob_every=%d row=%d busy=%d ctas=%d tiles=%d reps=%d verify=%s errors=%u distinct_sms=%d | "
            "clk_per_tile=%.0f (rep min %.0f max %.0f; CTA min %.0f max %.0f) GBps=%.0f (rep min %.0f max %.0f) "
            "ratio_vs_1530=%.3f sm_ghz=%.3f event_us=%.1f event_GBps=%.0f temp_C=%s smi_sm_mhz=%s profile=%d prod_busy_clk_per_tile=%.0f\n",
-           method, row_bytes, busy, ctas, tiles, reps, bad == 0 ? "OK" : "FAIL", bad, distinct_sms,
+           method, oob_every, row_bytes, busy, ctas, tiles, reps, bad == 0 ? "OK" : "FAIL", bad, distinct_sms,
            med(clk_per_tile), mn(clk_per_tile), mx(clk_per_tile), med(spread_lo), med(spread_hi), med(gbps),
            mn(gbps), mx(gbps), med(gbps) / 1530.0, med(ghz), med(evt_us), evt_gbps, temp.c_str(), sm_mhz.c_str(), profile, med(prod_busy));
     CK(cudaFree(kv));
