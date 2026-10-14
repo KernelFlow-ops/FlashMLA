@@ -8,12 +8,14 @@ import kernelkit as kk
 class KVCacheLayout(enum.Enum):
     V41_FP8Sparse = 0
     V41_FP4Sparse = 1
+    V41_MXFP4Sparse = 2     # OCP MX-style fp4: e2m1 data + one ue8m0 (power of two) scale per 32 elements; 272 B/token. Only has a Python reference, no kernel parses it yet
 
     def get_meta(self) -> Tuple[int, int, int, int, int]:
         # Return: (d, d_nope, d_rope, tile_size, num_tiles)
         return {
             KVCacheLayout.V41_FP8Sparse: (512, 448, 64, 32, 16),  # 14 NoPE + 2 RoPE tiles
             KVCacheLayout.V41_FP4Sparse: (512, 448, 64, 16, 32),  # 28 NoPE + 4 RoPE tiles, all fp4
+            KVCacheLayout.V41_MXFP4Sparse: (512, 448, 64, 32, 16),  # 14 NoPE + 2 RoPE tiles, all fp4
         }[self]
 
     def get_bytes_per_token(self) -> int:
@@ -21,6 +23,7 @@ class KVCacheLayout(enum.Enum):
         return {
             KVCacheLayout.V41_FP8Sparse: d_nope + d_rope + num_tiles,
             KVCacheLayout.V41_FP4Sparse: d // 2 + num_tiles,
+            KVCacheLayout.V41_MXFP4Sparse: d // 2 + num_tiles,
         }[self]
 
 def _cast_scale_inv_to_ue8m0(scales_inv: torch.Tensor, out_dtype = torch.float32) -> torch.Tensor:
@@ -132,6 +135,32 @@ def quantize_k_cache(
         result = result.view(num_blocks, block_size, 1, -1)
         return result
 
+    elif kvcache_layout == KVCacheLayout.V41_MXFP4Sparse:
+        # Token layout: [256 B fp4 data, 16 B ue8m0 scales]. The data is packed like V41_FP4Sparse (element i of a row is in byte i//2, even
+        # elements in the low nibble). One scale per 32 elements, a power of two: the smallest 2^e >= amax / 6 (6 = max magnitude of e2m1), i.e.
+        # the same rule as V41_FP8Sparse with 6 instead of 448 (including its lower clamp of the scale)
+        assert not kk.is_on_ascend_platform(), "V41_MXFP4Sparse is not supported on Ascend"
+        bytes_per_token = kvcache_layout.get_bytes_per_token()
+        result = torch.empty((num_blocks, block_size, bytes_per_token), dtype=torch.float8_e4m3fn, device=input_k_cache.device)
+        result_k_data = result[..., :d//2].view(torch.uint8)
+        result_k_scale = result[..., d//2:].view(torch.float8_e8m0fnu)
+
+        blocks_per_chunk = max(1, (1 << 26) // (block_size * d))
+        for b0 in range(0, num_blocks, blocks_per_chunk):
+            b1 = min(b0 + blocks_per_chunk, num_blocks)
+            n = b1 - b0
+            x = input_k_cache[b0: b1].float()
+            amax = torch.nan_to_num(x.abs(), nan=float("inf")).view(n, block_size, num_tiles, tile_size).amax(dim=-1)   # A NaN element poisons the whole tile
+            scale = _cast_scale_inv_to_ue8m0(amax / 6.0)
+            scale = torch.where(torch.isinf(amax), torch.full_like(scale, float("nan")), scale)
+            normalized = x.view(n, block_size, num_tiles, tile_size) / scale.unsqueeze(-1)
+            codes = _quantize_to_e2m1(normalized).view(n, block_size, d)
+            result_k_data[b0: b1] = codes[..., 0::2] | (codes[..., 1::2] << 4)
+            result_k_scale[b0: b1] = scale.to(torch.float8_e8m0fnu)
+
+        result = result.view(num_blocks, block_size, 1, -1)
+        return result
+
     else:
         raise NotImplementedError(f"Unsupported kvcache_layout: {kvcache_layout}")
     
@@ -185,6 +214,22 @@ def dequantize_k_cache(
                 codes[..., 1::2] = input_data[b0:b1] >> 4
                 values = _dequantize_e2m1(codes).view(b1 - b0, block_size, num_tiles, tile_size)
             # e2m1 x e4m3 has at most 2 + 4 significant bits, so the product is exact in bf16, as in the kernel
+            result[b0:b1] = (values * input_scale[b0:b1].to(values.dtype).unsqueeze(-1)).view(b1 - b0, block_size, d).to(torch.bfloat16)
+
+    elif kvcache_layout == KVCacheLayout.V41_MXFP4Sparse:
+        assert not kk.is_on_ascend_platform(), "V41_MXFP4Sparse is not supported on Ascend"
+        quant_k_cache = quant_k_cache.view(num_blocks, block_size, -1)
+        input_data = quant_k_cache[..., :d//2].view(torch.uint8)
+        input_scale = quant_k_cache[..., d//2:].view(torch.float8_e8m0fnu)  # [num_blocks, block_size, 16]
+
+        blocks_per_chunk = max(1, (1 << 26) // (block_size * d))
+        for b0 in range(0, num_blocks, blocks_per_chunk):
+            b1 = min(b0 + blocks_per_chunk, num_blocks)
+            codes = torch.empty((b1 - b0, block_size, d), dtype=torch.uint8, device=quant_k_cache.device)
+            codes[..., 0::2] = input_data[b0:b1] & 0xF
+            codes[..., 1::2] = input_data[b0:b1] >> 4
+            values = _dequantize_e2m1(codes).view(b1 - b0, block_size, num_tiles, tile_size)
+            # e2m1 x a power of two is exact in bf16
             result[b0:b1] = (values * input_scale[b0:b1].to(values.dtype).unsqueeze(-1)).view(b1 - b0, block_size, d).to(torch.bfloat16)
 
     else:
