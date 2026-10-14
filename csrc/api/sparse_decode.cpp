@@ -347,7 +347,11 @@ sparse_decode_fwd(
     // The formats of `kv` and `extra_kv`
     ModelType model_type = detect_sparse_decode_kv_format(kv.size(3));
     ModelType extra_model_type = have_extra_kcache ? detect_sparse_decode_kv_format(extra_kv->size(3)) : model_type;
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+    TORCH_CHECK(model_type != ModelType::V41_FP4 || arch.is_sm120f(), "The fp4 KV cache is only supported as extra_kv");
+#else
     TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
+#endif
     TORCH_CHECK(is_valid_kv_format_pair(model_type, extra_model_type), "invalid kv format pair, ", get_dynamic_enum_name(model_type), " and ", get_dynamic_enum_name(extra_model_type));
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     TORCH_CHECK((model_type != ModelType::V41_MXFP4 && extra_model_type != ModelType::V41_MXFP4) || arch.is_sm120f(),
