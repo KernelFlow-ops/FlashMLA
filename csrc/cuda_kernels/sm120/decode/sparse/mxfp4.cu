@@ -17,8 +17,11 @@ like the path of mxfp8.cu, whose structure this file follows (see there for the 
   tile before a value of the smaller one falls out of the e4m3 range (the e4m3 of a rebased FP8 tile has 8). The product is
   exact down to there; below it it is rounded to nearest. P is quantized to e4m3 with a constant scale.
 - NUM_P_TERMS = 2 writes P as the sum of two e4m3 terms (the rounded value and the rounded remainder, with a scale 16 times
-  smaller) and runs two PV MMAs for each; NUM_P_TERMS = 1 keeps 4 significant bits of P. The modes of run.cu: fp8x2 and bf16
-  (the default) are NUM_Q_TERMS = 4 with NUM_P_TERMS = 2, mxfp8 is NUM_Q_TERMS = 2 with NUM_P_TERMS = 1.
+  smaller) and runs two PV MMAs for each; NUM_P_TERMS = 1 keeps 4 significant bits of P. The modes of run.cu: mxfp4x4 is
+  NUM_Q_TERMS = 4 with NUM_P_TERMS = 2, mxfp8 is NUM_Q_TERMS = 2 with NUM_P_TERMS = 1. Four terms of Q leave an error of about 1e-4 of
+  |Q|, which moves the LSE of a query token that attends a single KV token by up to 3e-6, more than the upstream tolerance (1e-6 absolute
+  and 8/65536 relative: it matters where the LSE is below 0.01); the output is well within it. A fifth term (error 1e-5) would pass, but its
+  16 registers or 4 KB per warp do not fit next to the 128 registers of O and the 99 KB of shared memory.
 
 I/O: See SparseAttnDecodeParams in csrc/params.h
 */

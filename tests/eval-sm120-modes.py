@@ -381,16 +381,17 @@ def build_combos() -> List[Tuple[str, str, emu.Mode, Tuple[str, ...]]]:
 
     # ---- the MXFP4 kernel (csrc/cuda_kernels/sm120/decode/sparse/mxfp4.cu), parameter for parameter: QK on mxf4 2X (m16n8k64, fp32 per instruction), Q as N e2m1 terms with a
     #      ue8m0 scale per head and 32 dims (ceil-to-power-of-two(amax * fp32(1/6)), code clamped to [8, 250], residual chain), P = hi * 2^-2 + lo * 2^-6 as for mxfp8.cu,
-    #      V rebased per 32 tokens with the block exponent = (largest exponent of the valid tokens) - 6. mxfp8 tier: 2 Q terms, 1 P term; fp8x2 / bf16 tier: 4 and 2
+    #      V rebased per 32 tokens with the block exponent = (largest exponent of the valid tokens) - 6. mxfp8 tier: 2 Q terms, 1 P term; mxfp4x4 tier: 4 and 2
     mxk = lambda n: dict(mxfp4=OM(f"mxfp4x{n}", "native", "rebase", v_off=-6))
-    add("kernel-mxfp4-mxfp8", "the MXFP4 kernel, mxfp8 tier: Q x2 (mxfp4), P x1, V rebase with 6 exponent steps of headroom, B=32, fp32 per-instruction accumulation", MXFP4_KERNEL_FAMILIES,
-        **mxk(2), p="e4m3x1", **kern)
-    add("kernel-mxfp4-fp8x2", "the MXFP4 kernel, fp8x2 / bf16 tier: Q x4 (mxfp4), P x2, V rebase with headroom", MXFP4_KERNEL_FAMILIES, **mxk(4), p="e4m3x2", **kern)
-    add("kernel-mxfp4-q3p2", "MXFP4 kernel variant: Q x3, P x2", MXFP4_KERNEL_FAMILIES, **mxk(3), p="e4m3x2", **kern)
-    add("kernel-mxfp4-q4p1", "MXFP4 kernel variant: Q x4, P x1", MXFP4_KERNEL_FAMILIES, **mxk(4), p="e4m3x1", **kern)
-    add("kernel-mxfp4-q2p2", "MXFP4 kernel variant: Q x2, P x2", MXFP4_KERNEL_FAMILIES, **mxk(2), p="e4m3x2", **kern)
+    kern4 = dict(kern, accum="f32pair")       # QK of the two warps of a pair: partial sums over the two halves of the dims
+    add("kernel-mxfp4-mxfp8", "the MXFP4 kernel, mxfp8 tier: Q x2 (mxfp4), P x1, V rebase with 6 exponent steps of headroom, B=32, fp32 per-instruction accumulation (partial sums per warp of a pair)", MXFP4_KERNEL_FAMILIES,
+        **mxk(2), p="e4m3x1", **kern4)
+    add("kernel-mxfp4-fp8x2", "the MXFP4 kernel, mxfp4x4 tier: Q x4 (mxfp4), P x2, V rebase with headroom", MXFP4_KERNEL_FAMILIES, **mxk(4), p="e4m3x2", **kern4)
+    add("kernel-mxfp4-q3p2", "MXFP4 kernel variant: Q x3, P x2", MXFP4_KERNEL_FAMILIES, **mxk(3), p="e4m3x2", **kern4)
+    add("kernel-mxfp4-q4p1", "MXFP4 kernel variant: Q x4, P x1", MXFP4_KERNEL_FAMILIES, **mxk(4), p="e4m3x1", **kern4)
+    add("kernel-mxfp4-q2p2", "MXFP4 kernel variant: Q x2, P x2", MXFP4_KERNEL_FAMILIES, **mxk(2), p="e4m3x2", **kern4)
     add("kernel-mxfp4-nohead", "kernel-mxfp4-fp8x2 without the V headroom (rebase to the largest exponent, like mxfp8.cu)", MXFP4_KERNEL_FAMILIES,
-        mxfp4=OM("mxfp4x4", "native", "rebase"), p="e4m3x2", **kern)
+        mxfp4=OM("mxfp4x4", "native", "rebase"), p="e4m3x2", **kern4)
     return C
 
 
@@ -968,6 +969,26 @@ def selftest_framework(verbose: bool = True) -> bool:
                             acc = np.float32(acc + np.float32(float((qd[i_][b_, h_, 64 * st:64 * st + 64] * kd[b_, t_, 64 * st:64 * st + 64]).sum())))
                     want[b_, h_, t_] = acc
         report("qk_logits(f32seg) of the fp4 kinds: one fp32 rounding per k64 instruction == independent loop", np.array_equal(got, want), f"({int((got != want).sum())} of {want.size} differ)")
+        # the same with the warp-pair split (f32pair): two partial sums over steps 0..3 and 4..7, added at the end
+        qm3 = emu.quantize_q(qm[:2, :2], "mxfp4x3", 4, True)
+        kc = emu.e2m1_rn(torch.randn(2, 6, 512, generator=g, device="cuda") * 2)
+        ksf = torch.exp2(torch.randint(-6, 3, (2, 6, 16), generator=g, device="cuda").float())
+        got = emu.qk_logits(qm3, emu.Terms([kc], [ksf], 32, 64), "f32pair").cpu().numpy()
+        qd = [(v.double() * sf_.double().repeat_interleave(32, dim=-1)).cpu().numpy() for v, sf_ in zip(qm3.vals, qm3.sf)]
+        kd = (kc.double() * ksf.double().repeat_interleave(32, dim=-1)).cpu().numpy()
+        want = np.zeros((2, 2, 6), dtype=np.float32)
+        for b_ in range(2):
+            for h_ in range(2):
+                for t_ in range(6):
+                    halves = []
+                    for steps in (range(0, 4), range(4, 8)):
+                        acc = np.float32(0.0)
+                        for st in steps:
+                            for i_ in range(len(qd)):
+                                acc = np.float32(acc + np.float32(float((qd[i_][b_, h_, 64 * st:64 * st + 64] * kd[b_, t_, 64 * st:64 * st + 64]).sum())))
+                        halves.append(acc)
+                    want[b_, h_, t_] = np.float32(halves[0] + halves[1])
+        report("qk_logits(f32pair) of the mxf4 kind: two partial sums over the halves of the dims == independent loop", np.array_equal(got, want), f"({int((got != want).sum())} of {want.size} differ)")
         # the prescale only moves the ue4m3 scale floor: x6 with it must be much more accurate than x6 without it, and 'pa' must never clip (error bounded by the last term)
         e_plain = ((emu.quantize_q(q, "nvfp4x6").dense() - q.double()).norm() / q.double().norm()).item()
         e_pa = ((emu.quantize_q(q, "nvfp4x6pa").dense() - q.double()).norm() / q.double().norm()).item()
@@ -983,7 +1004,7 @@ def selftest_framework(verbose: bool = True) -> bool:
         ("fp8+fp4", "nvfp4x1 full + rz", emu.Mode(fp8=mx["fp8"], fp4=OM("nvfp4x1", "native", "rebase", "x1"), p="e4m3x1", rebase_round="rz")),
         ("mxfp4", "mxfp4x2 QK, rebase", emu.Mode(mxfp4=OM("mxfp4x2", "native", "rebase"), fp8=mx["fp8"], p="e4m3x2")),
         ("fp8+mxfp4", "mxfp8x2 + p bf16 + rebase", emu.Mode(**x2)),
-        ("mxfp4", "MXFP4 kernel, fp8x2 tier (Q x4 mxfp4 with the kernel rule, P x2, V headroom -6, B32)",
+        ("mxfp4", "MXFP4 kernel, mxfp4x4 tier (Q x4 mxfp4 with the kernel rule, P x2, V headroom -6, B32)",
          emu.Mode(mxfp4=OM("mxfp4x4", "native", "rebase", v_off=-6), p="e4m3x2", B=32, q_kernel_rule=True)),
         ("mxfp4-main", "MXFP4 kernel, mxfp8 tier (Q x2 mxfp4, P x1, V headroom -6, B32)",
          emu.Mode(mxfp4=OM("mxfp4x2", "native", "rebase", v_off=-6), p="e4m3x1", B=32, q_kernel_rule=True)),

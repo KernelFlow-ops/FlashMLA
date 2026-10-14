@@ -424,7 +424,8 @@ class Mode:
     m: str = "lazy"                     # row max used for P: lazy (upstream: update only when a block exceeds it by > 6) | final (row max over all tokens)
     B: int = 64                         # tokens per block: lazy-max update granularity and V rebase granularity (32 or 64)
     sum: str = "exact"                  # softmax denominator: exact (sum of fp32 P) | quant (sum of the quantized P that the MMA uses)
-    accum: str = "f64"                  # f64: exact sum rounded to fp32 once per logit / per block; f32seg: every 32-k MMA step rounded to fp32 and accumulated in fp32
+    accum: str = "f64"                  # f64: exact sum rounded to fp32 once per logit / per block; f32seg: every MMA step rounded to fp32 and accumulated in fp32;
+                                        # f32pair: as f32seg, but QK as two partial sums over the first / second half of the dims, added at the end (the warp pairs of the kernels)
     rebase_round: str = "rn"            # rn | rz: rounding when the rebase shifts a code into the subnormal range
     q_kernel_rule: bool = False         # Q scale rules of the kernels (mxfp8: fp32 reciprocal of 448, exponent clamped to [2 * q_lo_shift - 127, 123], no 1e-4 floor; nvfp4: smallest e4m3 >= amax / 6); see quantize_q
     lolo: bool = False                  # also issue the lo x lo MMA when both operands have a lo term (default: skipped, 3 instead of 4 MMAs for x2 x x2)
@@ -512,13 +513,19 @@ def qk_logits(qt: Terms, kt: Terms, accum: str, budget: int = 1 << 30, lolo: boo
         if accum == "f64":
             out[sl] = sum(p.sum(1) for p in parts).float()
         else:
-            acc = torch.zeros(parts[0].shape[0], h, T, dtype=torch.float32, device=out.device)
             ks = qt.k_step
             gps = ks // g       # scale groups per MMA instruction (k step 32 for the 8-bit kinds, 64 for the fp4 kinds)
-            for s in range(512 // ks):
-                for p in parts:
-                    acc = acc + p[:, s * gps:(s + 1) * gps].sum(1).float()
-            out[sl] = acc
+            nst = 512 // ks
+            # f32pair: the two warps of a pair of the sm120 kernels each accumulate half of the steps (from zero) and the two sums are added afterwards
+            ranges = [range(nst // 2), range(nst // 2, nst)] if accum == "f32pair" else [range(nst)]
+            accs = []
+            for steps in ranges:
+                acc = torch.zeros(parts[0].shape[0], h, T, dtype=torch.float32, device=out.device)
+                for s in steps:
+                    for p in parts:
+                        acc = acc + p[:, s * gps:(s + 1) * gps].sum(1).float()
+                accs.append(acc)
+            out[sl] = accs[0] if len(accs) == 1 else accs[0] + accs[1]
     return out
 
 
