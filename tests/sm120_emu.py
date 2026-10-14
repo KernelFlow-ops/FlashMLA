@@ -96,6 +96,22 @@ def ue4m3_rn(x: torch.Tensor) -> torch.Tensor:
     return e4m3_rn(torch.clamp(x, 2.0 ** -9, E4M3_MAX))
 
 
+Q_RECIP_6 = float(torch.tensor(1.0 / 6.0, dtype=torch.float32))           # the fp32 constant the P3 kernel multiplies amax with
+
+
+def ue4m3_scale_ceil(amax: torch.Tensor, qmax: float = E2M1_MAX) -> torch.Tensor:
+    """
+    The NVFP4 block scale of the P3 kernel for a group with maximum `amax`: the smallest e4m3 value s with 6 * s >= amax (so that amax / s <= 6 and no code saturates), clamped to
+    [2^-9, 448]. Computed as the kernel does: the guess e4m3_rn(amax * fp32(1/6)) and, if 6 * s is still below amax, the next e4m3 value (6 * s is exact in float32: a 4-bit times a 2-bit
+    significand; the guess is the smallest satisfying value or the one below it). An all-zero group gets 2^-9 (its codes are zero anyway)
+    """
+    s = e4m3_rn(torch.clamp(amax * Q_RECIP_6, max=E4M3_MAX))
+    e = torch.where(s > 0, floor_log2(s), torch.full_like(floor_log2(s), E4M3_MIN_EXP)).clamp(min=E4M3_MIN_EXP)       # floor_log2(0) is -1: a zero guess has the subnormal step 2^-9
+    nxt = s + pow2f(e - 3).to(s.dtype)                                         # the next e4m3 value above s (also across the subnormal / normal boundary and for s = 0)
+    s = torch.where(s * qmax < amax, nxt, s)
+    return torch.clamp(s, 2.0 ** -9, E4M3_MAX)
+
+
 # ----------------------------------------------------------------------------------------------
 # ue8m0 scales
 # ----------------------------------------------------------------------------------------------
@@ -130,6 +146,7 @@ class Terms:
     vals: List[torch.Tensor]    # each [..., 512] float32
     sf: List[torch.Tensor]      # each [..., 512 // g] float32 (a power of two for ue8m0, an e4m3 value for ue4m3)
     g: int
+    k_step: int = 32            # k extent of one MMA instruction (32: mxf8f6f4, 64: the fp4 kinds m16n8k64); the fp32 accumulation rounds once per instruction
 
     def dense(self) -> torch.Tensor:
         """The represented tensor in float64"""
@@ -139,14 +156,15 @@ class Terms:
         return out
 
 
-_QMODE_RE = re.compile(r"(mxfp8|nvfp4|mxfp4)x([1-8])(?:p([0-9]+|a))?")
+_QMODE_RE = re.compile(r"(mxfp8|nvfp4|mxfp4)x([1-8])(?:p([0-9]+|a|e))?")
 
 
 def parse_q_mode(name: str) -> Tuple[str, int]:
     """
     'bf16' -> ('bf16', 1); 'mxfp8x2' -> ('mxfp8', 2); also nvfp4x{1..8}, mxfp4x{1..8}. A suffix 'p<k>' (e.g. 'nvfp4x6p8') means Q is multiplied by 2^k before it is quantized
     and the scales are divided by 2^k afterwards (a power-of-two prescale, folded into the logit scale on the device); 'pa' picks k per row as the largest value for which
-    amax * 2^k / 6 still fits the ue4m3 range (<= 448); it is ignored here, see quantize_q
+    amax * 2^k / 6 still fits the ue4m3 range (<= 448); 'pe' is the exponent-only rule of the P3 kernel, k = 10 - floor(log2(amax)) (amax * 2^k in [1024, 2048)); both are ignored here,
+    see quantize_q
     """
     if name == "bf16":
         return "bf16", 1
@@ -166,9 +184,11 @@ def quantize_q(q: torch.Tensor, name: str, lo_shift: int = 4, kernel_rule: bool 
                i.e. the scale of the lo term is 2^-lo_shift times the scale of the previous term
       nvfp4  : per (row, 16 dims) ue4m3 scale round_e4m3(amax / 6), e2m1 data; every further term quantizes the residual with its own scale
       mxfp4  : per (row, 32 dims) ue8m0 scale 2^ceil(log2(amax / 6)), e2m1 data; further terms as for nvfp4
-    kernel_rule (mxfp8 only): the scale rule of the P2 kernel (mxfp8.cu quantize_q): ue8m0 code = ceil-to-power-of-two(amax * fp32(1/448)) clamped to [2 * lo_shift, 250], i.e. the
+    kernel_rule (mxfp8): the scale rule of the P2 kernel (mxfp8.cu quantize_q): ue8m0 code = ceil-to-power-of-two(amax * fp32(1/448)) clamped to [2 * lo_shift, 250], i.e. the
     exponent to [2 * lo_shift - 127, 123] and no 1e-4 floor of the cache writer; the multiplication by the fp32 reciprocal differs from the division by 448 only when amax is within
-    one fp32 ulp of 448 * 2^k
+    one fp32 ulp of 448 * 2^k.
+    kernel_rule (nvfp4): the rule of the P3 kernel: s = the smallest e4m3 value >= amax / 6 (ue4m3_scale_ceil: no code saturates; the plain rule rounds to nearest, which can
+    make amax / s slightly larger than 6), codes from y = fp32(x * fp32(1 / s)) (reciprocal and multiply, not a division: e2m1 ties can land differently), residual fp32 x - code * s
     """
     kind, n = parse_q_mode(name)
     lead = q.shape[:-1]
@@ -179,10 +199,13 @@ def quantize_q(q: torch.Tensor, name: str, lo_shift: int = 4, kernel_rule: bool 
         if m.group(3) == "a":
             amax = q.abs().amax(-1, keepdim=True)
             k = torch.floor(torch.log2(448.0 * E2M1_MAX / amax.clamp_min(1e-30))).clamp(0, 30)
+        elif m.group(3) == "e":
+            amax = q.abs().amax(-1, keepdim=True)
+            k = (10 - floor_log2(amax.clamp_min(1e-30))).clamp(-30, 30).float()          # amax * 2^k in [1024, 2048): the largest group scale is at most 2048 / 6 -> 352 <= 448
         else:
             k = torch.full(lead + (1,), float(int(m.group(3))), dtype=torch.float32, device=q.device)
-        t = quantize_q(q * torch.exp2(k), name[:name.rindex("p")], lo_shift)
-        return Terms(t.vals, [sf * torch.exp2(-k) for sf in t.sf], t.g)
+        t = quantize_q(q * torch.exp2(k), name[:name.rindex("p")], lo_shift, kernel_rule)
+        return Terms(t.vals, [sf * torch.exp2(-k) for sf in t.sf], t.g, t.k_step)
     vals, sfs = [], []
     if kind == "mxfp8":
         r = q.reshape(*lead, 16, 32)
@@ -200,18 +223,24 @@ def quantize_q(q: torch.Tensor, name: str, lo_shift: int = 4, kernel_rule: bool 
     if kind == "nvfp4":
         r = q.reshape(*lead, 32, 16)
         for i in range(n):
-            sf = ue4m3_rn(r.abs().amax(-1) / E2M1_MAX)
-            d = e2m1_rn(r / sf.unsqueeze(-1))
+            if kernel_rule:
+                # the kernel: s = smallest e4m3 >= amax / 6, inv = fp32 1 / s, y = fp32 (x * inv), code = e2m1_rn(y) (satfinite); the residual x - code * s in fp32 (the product is exact: an fma)
+                sf = ue4m3_scale_ceil(r.abs().amax(-1))
+                inv = 1.0 / sf
+                d = e2m1_rn(r * inv.unsqueeze(-1))
+            else:
+                sf = ue4m3_rn(r.abs().amax(-1) / E2M1_MAX)
+                d = e2m1_rn(r / sf.unsqueeze(-1))
             vals.append(d.reshape(*lead, 512)), sfs.append(sf)
             r = r - d * sf.unsqueeze(-1)
-        return Terms(vals, sfs, 16)
+        return Terms(vals, sfs, 16, 64)
     r = q.reshape(*lead, 16, 32)       # mxfp4
     for i in range(n):
         sf = pow2f(ue8m0_exp(r.abs().amax(-1) / E2M1_MAX, floor_val=1e-4 if i == 0 else None))
         d = e2m1_rn(r / sf.unsqueeze(-1))
         vals.append(d.reshape(*lead, 512)), sfs.append(sf)
         r = r - d * sf.unsqueeze(-1)
-    return Terms(vals, sfs, 32)
+    return Terms(vals, sfs, 32, 64)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -322,6 +351,31 @@ def rebase_v(codes: torch.Tensor, exps: torch.Tensor, valid: torch.Tensor, B: in
     return cp, sfb
 
 
+def direct_v_terms(sd: ScopeData, form: str, B: int, lo_shift: int = 4) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """
+    V of a V41_FP4Sparse cache straight to e4m3 on one scale per (block of B tokens, 32 dims), single rounding (the producer of the P3 kernel): v = e2m1 * s16 (exact),
+    E = ceil(log2(amax / 448)) with amax over the VALID tokens of the block and the 32 dims, code = e4m3_rn(v / 2^E), SF_B = 2^E. form 'd2' adds a lo term
+    e4m3_rn((v - hi * 2^E) / 2^(E - lo_shift)) on the scale 2^(E - lo_shift). Returns ([codes [bs, T, 512]], [SF_B [bs, T // 32, 512]]) like rebase_v
+    """
+    assert sd.layout == quant.KVCacheLayout.V41_FP4Sparse and form in ("d1", "d2"), (sd.layout, form)
+    vals, _, sfv = decode_native(sd)
+    bs, T, _ = vals.shape
+    nb = T // B
+    v = (vals * sfv.repeat_interleave(16, dim=-1)).view(bs, nb, B, 16, 32)             # exact in float32
+    vmask = sd.valid.view(bs, nb, B, 1, 1)
+    amax = torch.where(vmask, v.abs(), torch.zeros_like(v)).amax((2, 4))              # [bs, nb, 16]
+    E = torch.where(amax > 0, ue8m0_exp(amax / E4M3_MAX, floor_val=None), torch.zeros_like(ue8m0_exp(amax, None)))
+    codes, sfbs, r = [], [], v
+    for i in range(1 if form == "d1" else 2):
+        Ei = torch.clamp(E - i * lo_shift, min=UE8M0_MIN_EXP)
+        sf = pow2f(Ei).view(bs, nb, 1, 16, 1)
+        d = e4m3_rn(r / sf)
+        codes.append(torch.where(vmask, d, torch.zeros_like(d)).view(bs, T, 512))
+        sfbs.append(pow2f(Ei).repeat_interleave(B // 32, dim=1).repeat_interleave(32, dim=-1))
+        r = r - d * sf
+    return codes, sfbs
+
+
 # ----------------------------------------------------------------------------------------------
 # Modes
 # ----------------------------------------------------------------------------------------------
@@ -331,7 +385,9 @@ class OperandMode:
     q: str = "bf16"         # Q: bf16 | mxfp8x{1,2} | nvfp4x{1..4} | mxfp4x{1..4}
     k: str = "exact"        # K (QK B operand): exact (bf16, only with q = bf16) | native | k8x1 | k8x2 (fp4 cache converted to e4m3 + ue8m0)
     v: str = "exact"        # V (PV B operand): exact (bf16) | rebase (e4m3 on a common scale per block and 32 dims)
-    v8: str = "x1"          # the 8-bit form V is built from when the cache is not MXFP8 already (V41_FP4Sparse): x1 | x2
+    v8: str = "x1"          # the 8-bit form V is built from when the cache is not MXFP8 already (V41_FP4Sparse): x1 | x2 (per token e4m3 x ue8m0 first, then the rebase: two roundings),
+                            # d1 | d2 (direct: e2m1 x s16 -> e4m3 on the block scale in one rounding, see direct_v_terms)
+    q_src: str = "bf16"     # what Q is quantized from: bf16 (the original Q) | mxfp8x1 (the e4m3 Q the main tile already uses, quantized with the kernel rule and dequantized exactly; only q = nvfp4 / mxfp4 modes)
 
 
 EXACT_OPS = OperandMode()
@@ -352,7 +408,7 @@ class Mode:
     sum: str = "exact"                  # softmax denominator: exact (sum of fp32 P) | quant (sum of the quantized P that the MMA uses)
     accum: str = "f64"                  # f64: exact sum rounded to fp32 once per logit / per block; f32seg: every 32-k MMA step rounded to fp32 and accumulated in fp32
     rebase_round: str = "rn"            # rn | rz: rounding when the rebase shifts a code into the subnormal range
-    q_kernel_rule: bool = False         # Q scale rule of the P2 kernel (fp32 reciprocal of 448, exponent clamped to [2 * q_lo_shift - 127, 123], no 1e-4 floor); see quantize_q
+    q_kernel_rule: bool = False         # Q scale rules of the kernels (mxfp8: fp32 reciprocal of 448, exponent clamped to [2 * q_lo_shift - 127, 123], no 1e-4 floor; nvfp4: smallest e4m3 >= amax / 6); see quantize_q
     lolo: bool = False                  # also issue the lo x lo MMA when both operands have a lo term (default: skipped, 3 instead of 4 MMAs for x2 x x2)
 
     def ops(self, layout) -> OperandMode:
@@ -370,8 +426,10 @@ def check_operand_mode(layout, om: OperandMode):
         assert layout == L.V41_FP4Sparse and om.k == "native", f"{layout}: {om}"
     else:
         assert layout == L.V41_MXFP4Sparse and om.k == "native", f"{layout}: {om}"
+    assert om.q_src in ("bf16", "mxfp8x1") and (om.q_src == "bf16" or kind in ("nvfp4", "mxfp4"))
     assert om.v in ("exact", "rebase")
-    assert om.v8 in ("x1", "x2")
+    assert om.v8 in ("x1", "x2", "d1", "d2")
+    assert om.v8 in ("x1", "x2") or layout == L.V41_FP4Sparse or om.v == "exact", f"{layout}: {om}: the direct V forms exist only for V41_FP4Sparse"
 
 
 def k_terms(sd: ScopeData, om: OperandMode, mode: Mode) -> Terms:
@@ -396,6 +454,8 @@ def v_terms(sd: ScopeData, om: OperandMode, mode: Mode) -> Tuple[List[torch.Tens
     bs, T, _ = sd.kdeq.shape
     if om.v == "exact":
         return [sd.kdeq.float()], [torch.ones(bs, T // 32, 512, dtype=torch.float32, device=sd.kdeq.device)]
+    if om.v8 in ("d1", "d2"):
+        return direct_v_terms(sd, om.v8, mode.B, mode.k_lo_shift)
     terms = eight_bit_terms(sd, om.v8, mode.k_lo_shift)
     vals, sfbs = [], []
     for codes, exps in terms:
@@ -435,8 +495,9 @@ def qk_logits(qt: Terms, kt: Terms, accum: str, budget: int = 1 << 30, lolo: boo
             out[sl] = sum(p.sum(1) for p in parts).float()
         else:
             acc = torch.zeros(parts[0].shape[0], h, T, dtype=torch.float32, device=out.device)
-            gps = 32 // g       # groups per 32-element MMA k step
-            for s in range(16):
+            ks = qt.k_step
+            gps = ks // g       # scale groups per MMA instruction (k step 32 for the 8-bit kinds, 64 for the fp4 kinds)
+            for s in range(512 // ks):
                 for p in parts:
                     acc = acc + p[:, s * gps:(s + 1) * gps].sum(1).float()
             out[sl] = acc
@@ -558,6 +619,13 @@ def softmax_pv(logits: torch.Tensor, valid: torch.Tensor, vv: List[torch.Tensor]
     return out, lse
 
 
+def source_q(q: torch.Tensor, om: OperandMode, mode: Mode) -> torch.Tensor:
+    """The tensor Q is quantized from for this operand mode: the original Q, or the mxfp8x1 Q of the main tile (exact in float32: an e4m3 value times a power of two)"""
+    if om.q_src == "bf16":
+        return q
+    return quantize_q(q, om.q_src, mode.q_lo_shift, mode.q_kernel_rule).dense().float()
+
+
 def simulate_decode(p, t, mode: Mode) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Emulate the decode attention of a testcase (lib.TestcaseForDecode) in the given precision mode.
@@ -572,9 +640,9 @@ def simulate_decode(p, t, mode: Mode) -> Tuple[torch.Tensor, torch.Tensor]:
     logits, valids, v_lists = [], [], []
     for sd in sds:
         om = mode.ops(sd.layout)
-        if om.q not in q_cache:
-            q_cache[om.q] = quantize_q(q, om.q, mode.q_lo_shift, mode.q_kernel_rule)
-        logits.append(qk_logits(q_cache[om.q], k_terms(sd, om, mode), mode.accum, lolo=mode.lolo))
+        if (om.q, om.q_src) not in q_cache:
+            q_cache[(om.q, om.q_src)] = quantize_q(source_q(q, om, mode), om.q, mode.q_lo_shift, mode.q_kernel_rule)
+        logits.append(qk_logits(q_cache[(om.q, om.q_src)], k_terms(sd, om, mode), mode.accum, lolo=mode.lolo))
         valids.append(sd.valid)
         v_lists.append(v_terms(sd, om, mode))
     nv = max(len(v[0]) for v in v_lists)

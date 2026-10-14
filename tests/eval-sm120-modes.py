@@ -333,6 +333,39 @@ def build_combos() -> List[Tuple[str, str, emu.Mode, Tuple[str, ...]]]:
     for n in (3, 4):
         add(f"nvfp4x{n}-full", f"main fp8x2 pipeline; fp4 extra: q-nvfp4x{n} native QK, v rebase with v8 x2; p-e4m3x2", HAS_FP4, fp8=x2["fp8"], fp4=OM(f"nvfp4x{n}", "native", "rebase", "x2"), p="e4m3x2")
 
+    # ---- P3 first step: mxfp8 mode with a V41_FP4 extra cache (the kernel rows). The main cache tile = kernel-mxfp8 exactly. The fp4 tile: QK on mxf4nvf4 4X (m16n8k64) with K as stored
+    #      (e2m1 + a ue4m3 scale per 16 dims) and Q re-quantized from bf16 into N NVFP4 terms (scale = the smallest e4m3 >= amax / 6 per head and 16 dims, residual chain, one MMA stream per
+    #      term, fp32 accumulation per k64 instruction); an optional per-head power-of-two prescale of Q (folded into the logit scale). PV: P as e4m3 (like the main tile), V converted by the
+    #      producer straight from e2m1 x s16 to e4m3 on a scale 2^E per (tile of 32 tokens, 32 dims), E = ceil(log2(amax / 448)) over the valid tokens (d1: one term, d2: hi + lo)
+    nv1 = lambda n, pre="": OM(f"nvfp4x{n}{pre}", "native", "rebase", "d1")
+    for n in (1, 2, 3, 4):
+        add(f"p3-mxfp8-nvq{n}", f"P3 step 1, Q of the fp4 tile as {n} NVFP4 term(s), no prescale; main tile = kernel-mxfp8; fp4 V one e4m3 term (d1); P e4m3 x1; B=32", HAS_FP4, fp8=mx["fp8"], fp4=nv1(n), p="e4m3x1", **kern)
+    for n in (2, 3, 4):
+        add(f"p3-mxfp8-nvq{n}pa", f"P3 step 1, {n} NVFP4 Q terms with the per-head prescale 2^floor(log2(2688 / amax_head)) (largest group scale <= 448)", HAS_FP4, fp8=mx["fp8"], fp4=nv1(n, "pa"), p="e4m3x1", **kern)
+    for n in (2, 3, 4):
+        add(f"p3-mxfp8-nvq{n}pe", f"P3 step 1, {n} NVFP4 Q terms with the exponent-only prescale 2^(10 - floor(log2(amax_head))) (head amax in [1024, 2048))", HAS_FP4, fp8=mx["fp8"], fp4=nv1(n, "pe"), p="e4m3x1", **kern)
+    # floor of the mode: the main tile as above, an ideal fp4 tile (bf16 QK and bf16 PV on the dequantized cache); Q of the fp4 tile requantized from the e4m3 Q of the main tile (q8) instead of bf16 Q
+    add("p3-mxfp8-fp4exact", "P3 step 1 floor: main tile = kernel-mxfp8, fp4 tile exact (bf16 QK and PV), P e4m3x1, B=32: the error the mode has even with a perfect fp4 tile", HAS_FP4, fp8=mx["fp8"], fp4=OM(), p="e4m3x1", **kern)
+    q8 = lambda n, pre="": dataclasses.replace(nv1(n, pre), q_src="mxfp8x1")
+    for n in (1, 2, 3, 4):
+        add(f"p3-mxfp8-nvq{n}-q8", f"as p3-mxfp8-nvq{n} but the NVFP4 Q terms are quantized from the e4m3 Q of the main tile (mxfp8x1, kernel rule) instead of bf16 Q", HAS_FP4, fp8=mx["fp8"], fp4=q8(n), p="e4m3x1", **kern)
+    for n in (2, 3):
+        add(f"p3-mxfp8-nvq{n}pe-q8", f"as p3-mxfp8-nvq{n}-q8 with the exponent prescale 'pe'", HAS_FP4, fp8=mx["fp8"], fp4=q8(n, "pe"), p="e4m3x1", **kern)
+    for n in (2, 3):
+        add(f"p3-mxfp8-nvq{n}-v2", f"as p3-mxfp8-nvq{n} but the V of the fp4 tile as hi + lo e4m3 (d2): the PV of the fp4 tile issues P V_hi and P V_lo (two MMAs instead of one)", HAS_FP4,
+            fp8=mx["fp8"], fp4=OM(f"nvfp4x{n}", "native", "rebase", "d2"), p="e4m3x1", **kern)
+    add("p3-fp8x2-nvq4pa-v1", "control: main tile = kernel-fp8x2 (Q x2, P x2); fp4 tile: 4 prescaled NVFP4 Q terms, P x2, V one e4m3 term (d1)", HAS_FP4, fp8=x2["fp8"], fp4=nv1(4, "pa"), p="e4m3x2", **kern)
+    add("p3-fp8x2-nvq4pa-v2", "control: as p3-fp8x2-nvq4pa-v1 with V as hi + lo (d2); PV issues P_hi V_hi, P_hi V_lo, P_lo V_hi (lo x lo not issued)", HAS_FP4, fp8=x2["fp8"],
+        fp4=OM("nvfp4x4pa", "native", "rebase", "d2"), p="e4m3x2", **kern)
+    # attribution rows (one source of error each, the rest exact; the kernel parameters otherwise)
+    for n in (1, 2, 3, 4):
+        add(f"p3-qk-nvq{n}", f"QK only of the fp4 tile: {n} NVFP4 Q term(s) (kernel scale rule), no prescale; everything else exact", HAS_FP4, fp4=OM(f"nvfp4x{n}", "native", "exact"), **kern)
+        add(f"p3-qk-nvq{n}pa", f"QK only of the fp4 tile: {n} NVFP4 Q term(s) with the prescale 'pa'; everything else exact", HAS_FP4, fp4=OM(f"nvfp4x{n}pa", "native", "exact"), **kern)
+    add("p3-pv-d1", "PV only: V of the fp4 tile as one e4m3 term on the tile scale (d1); P bf16", HAS_FP4, fp4=OM("bf16", "exact", "rebase", "d1"), **kern)
+    add("p3-pv-d2", "PV only: V of the fp4 tile as hi + lo e4m3 on the tile scale (d2); P bf16", HAS_FP4, fp4=OM("bf16", "exact", "rebase", "d2"), **kern)
+    add("p3-p1-only", "P as one e4m3 term only (B=32, constant SF_A); everything else exact: the error floor of the one-term P in the mxfp8 mode", HAS_FP4, p="e4m3x1", **kern)
+    add("p3-p2-only", "P as two e4m3 terms only; everything else exact", HAS_FP4, p="e4m3x2", **kern)
+
     # ---- MXFP4 (e2m1 + ue8m0 per 32): Q as e4m3 (mxf8f6f4) or e2m1 (mxf4)
     for q in ("mxfp8x1", "mxfp8x2", "mxfp4x1", "mxfp4x2", "mxfp4x3", "mxfp4x4", "mxfp4x6"):
         add(f"mxfp4-{q}-qk", f"q-{q} on the MXFP4 cache (QK only; everything else exact)", HAS_MXFP4, mxfp4=OM(q, "native", "exact"))
@@ -493,6 +526,16 @@ def _ceil_log2_py(x: float) -> int:
     return e - 1 if m == 0.5 else e
 
 
+def _slow_fp4_dequant(row: torch.Tensor) -> torch.Tensor:
+    """One V41_FP4Sparse cache row (uint8 [bytes], cpu) -> the 512 values e2m1 * ue4m3 scale per 16 dims (float32, exact)"""
+    nib = []
+    for i in range(256):
+        byte = int(row[i])
+        for code in (byte & 0xF, byte >> 4):
+            nib.append((-1.0 if code & 8 else 1.0) * _E2M1_TAB[code & 7])
+    return torch.tensor(nib, dtype=torch.float32) * row[256:288].view(torch.float8_e4m3fn).float().repeat_interleave(16)
+
+
 def _slow_token_terms8(layout, row: torch.Tensor, form: str, lo_shift: int):
     """One cache row (uint8 [bytes], cpu) -> [(codes float32 [512], exps list[16])]: the MXFP8 form (data * 2^exp per 32 dims)"""
     import numpy as np
@@ -577,7 +620,12 @@ def slow_decode_token(t, mode: emu.Mode, bi: int, si: int) -> Tuple[torch.Tensor
             else:
                 kt = [vals * torch.tensor([2.0 ** (int(x) - 127) for x in row[256:272]], dtype=torch.float64).repeat_interleave(32)]
         kterm.append(kt)
-        vterm.append([kdeq.float()] if om.v == "exact" else _slow_token_terms8(layout, row, om.v8, mode.k_lo_shift))
+        if om.v == "exact":
+            vterm.append([kdeq.float()])
+        elif om.v8 in ("d1", "d2"):
+            vterm.append([_slow_fp4_dequant(row)])           # the direct forms work on the block, see the PV loop
+        else:
+            vterm.append(_slow_token_terms8(layout, row, om.v8, mode.k_lo_shift))
 
     scale = np.float32(float(torch.tensor(t.sm_scale * emu.LOG2E, dtype=torch.float32)))
     outs, lses = [], []
@@ -589,11 +637,11 @@ def slow_decode_token(t, mode: emu.Mode, bi: int, si: int) -> Tuple[torch.Tensor
             if not valid:
                 continue
             om = mode.ops(layout)
-            if om.q not in qcache:
-                qt = emu.quantize_q(q[hd:hd + 1], om.q, mode.q_lo_shift, mode.q_kernel_rule)
-                qcache[om.q] = [(v[0].double() * s[0].double().repeat_interleave(qt.g)) for v, s in zip(qt.vals, qt.sf)]
+            if (om.q, om.q_src) not in qcache:
+                qt = emu.quantize_q(emu.source_q(q[hd:hd + 1], om, mode), om.q, mode.q_lo_shift, mode.q_kernel_rule)
+                qcache[(om.q, om.q_src)] = [(v[0].double() * s[0].double().repeat_interleave(qt.g)) for v, s in zip(qt.vals, qt.sf)]
             acc = 0.0
-            for i, qd in enumerate(qcache[om.q]):
+            for i, qd in enumerate(qcache[(om.q, om.q_src)]):
                 for j, kd_ in enumerate(kterm[n]):
                     if i > 0 and j > 0 and not mode.lolo:
                         continue
@@ -656,14 +704,31 @@ def slow_decode_token(t, mode: emu.Mode, bi: int, si: int) -> Tuple[torch.Tensor
                             tot += float((pterm[i][kb][0] * pterm[i][kb][1]).sum())
                 ls = np.float32(tot)
             # --- V terms of the block (rebase per 32 dims over the valid tokens of the block)
+            om_blk = mode.ops(toks[n0][0])
+            direct = om_blk.v == "rebase" and om_blk.v8 in ("d1", "d2")
             nv = max(len(vterm[n0 + k]) for k in range(B) if valid_arr[n0 + k]) if valid_arr[n0:n0 + B].any() else 1
+            nv = (2 if om_blk.v8 == "d2" else 1) if direct else nv
             vdat = [np.zeros((B, 512)) for _ in range(nv)]       # float64 data
             vsf = [np.ones(512) for _ in range(nv)]              # SF_B per column
-            om_blk = mode.ops(toks[n0][0])
             if om_blk.v == "exact":
                 for k in range(B):
                     if valid_arr[n0 + k]:
                         vdat[0][k] = vterm[n0 + k][0].double().numpy()
+            elif direct:
+                # e2m1 * s16 straight to e4m3 on the scale 2^E of (this block, 32 dims), E = ceil(log2(amax / 448)) over the valid tokens; d2: the lo term on 2^(E - 4)
+                vk = [k for k in range(B) if valid_arr[n0 + k]]
+                for g in range(16):
+                    amax = max((float(vterm[n0 + k][0][32 * g:32 * g + 32].abs().max()) for k in vk), default=0.0)
+                    E = _ceil_log2_py(float(np.float32(amax) / np.float32(448.0))) if amax > 0 else 0
+                    for jt in range(nv):
+                        vsf[jt][32 * g:32 * g + 32] = 2.0 ** (E - 4 * jt)
+                    for k in vk:
+                        x = vterm[n0 + k][0][32 * g:32 * g + 32]
+                        hi = emu.e4m3_rn(x / (2.0 ** E))
+                        vdat[0][k, 32 * g:32 * g + 32] = hi.double().numpy()
+                        if nv == 2:
+                            lo = emu.e4m3_rn((x - hi * (2.0 ** E)) / (2.0 ** (E - 4)))
+                            vdat[1][k, 32 * g:32 * g + 32] = lo.double().numpy()
             else:
                 for jt in range(nv):
                     for g in range(16):
@@ -758,6 +823,81 @@ def selftest_framework(verbose: bool = True) -> bool:
                     if not np.array_equal(mine, want):
                         bad += 1
         report("kernel Q rule (amax * fp32(1/448), code clamp [8, 250], hi/lo e4m3) == independent scalar implementation", bad == 0, f"({bad} of {qk.shape[0] * qk.shape[1] * 16} groups differ)")
+        # the P3 kernel's NVFP4 Q rule (scale = smallest e4m3 >= amax / 6 per 16 dims, residual chain, prescale 'pe' / 'pa' per row) against an independent scalar implementation built from
+        # the small float tables (first principles: table search for the scale, table rounding of the e2m1 codes, numpy float32 reciprocal and multiply, fp32 residuals)
+        t_e4m3 = emu._small_float_table(3, 7, 0x7E)
+        t_e2m1 = emu._small_float_table(1, 1, 7)
+
+        def slow_nv(rowf: "np.ndarray", n: int, pre: str) -> "np.ndarray":
+            amax_row = float(np.abs(rowf).max())
+            if amax_row == 0.0:
+                return np.zeros(512)
+            if pre == "pe":
+                k = min(max(10 - (math.frexp(amax_row)[1] - 1), -30), 30)
+            elif pre == "pa":
+                k = min(max(math.floor(math.log2(448.0 * 6.0 / amax_row)), 0), 30)
+            else:
+                k = 0
+            r = (rowf.astype(np.float64) * 2.0 ** k).astype(np.float32)
+            dense = np.zeros(512)
+            for _ in range(n):
+                nr = r.copy()
+                for g_ in range(32):
+                    x = r[16 * g_:16 * g_ + 16]
+                    amax = float(np.abs(x).max())
+                    sc = next((v for v in t_e4m3[1:] if 6.0 * v >= amax), t_e4m3[-1])
+                    inv = np.float32(1.0) / np.float32(sc)
+                    for j_ in range(16):
+                        d = emu._table_round(float(x[j_] * inv), t_e2m1)           # y = fp32 (x * fp32 (1 / s))
+                        dense[16 * g_ + j_] += d * sc
+                        nr[16 * g_ + j_] = np.float32(float(x[j_]) - d * sc)        # fp32 residual (the product is exact: one rounding, like an fma)
+                r = nr
+            return dense / 2.0 ** k
+
+        qn = q.clone()
+        qn[0, 0, :16] = qn[0, 0, :16] * 1e-12                  # tiny group: the scale floor 2^-9
+        qn[0, 1, :] = 0.0                                      # all-zero row
+        qn[1, 0, :] = qn[1, 0, :] * 300.0                      # large row: negative exponent prescale / scale clamp
+        qn[1, 1, 5] = 1344.0                                   # amax = 2688 / 2: exact boundary of the 'pa' rule
+        qn[2, 0, 7] = 2688.0
+        qn[2, 1, 3] = 3000.0                                   # beyond the range of the ue4m3 scale without prescale
+        qn = qn.to(torch.bfloat16).float()
+        rows = [(b_, r_) for b_ in range(3) for r_ in range(qn.shape[1])]
+        for name, n, pre in (("nvfp4x1", 1, ""), ("nvfp4x2pe", 2, "pe"), ("nvfp4x3pa", 3, "pa"), ("nvfp4x4pe", 4, "pe"), ("nvfp4x4pa", 4, "pa"), ("nvfp4x4", 4, "")):
+            rec = emu.quantize_q(qn, name, 4, True).dense().cpu().numpy()
+            bad = sum(not np.array_equal(rec[b_, r_], slow_nv(qn[b_, r_].cpu().numpy(), n, pre)) for b_, r_ in rows)
+            report(f"kernel NVFP4 Q rule [{name}] == independent scalar implementation", bad == 0, f"({bad} of {len(rows)} rows differ)")
+        # the rounding-up scale rule: the first term never saturates (group amax <= 6 * scale) wherever the scale is below its upper limit 448; the plain rule (nearest e4m3) does not guarantee it
+        amax_g = qn.double().view(*qn.shape[:-1], 32, 16).abs().amax(-1)
+        sc0 = emu.quantize_q(qn, "nvfp4x4", 4, True).sf[0].double()
+        sc0_plain = emu.quantize_q(qn, "nvfp4x4", 4, False).sf[0].double()
+        report("kernel NVFP4 Q rule: group amax <= 6 * scale wherever scale < 448", bool((amax_g[sc0 < 448.0] <= 6.0 * sc0[sc0 < 448.0]).all()),
+               f"(the nearest-e4m3 rule violates it for {int((amax_g > 6.0 * sc0_plain)[sc0_plain < 448.0].sum())} of {amax_g.numel()} groups)")
+        qd8 = emu.quantize_q(torch.cat([q, qk], 0), "mxfp8x1", 4, True).dense()
+        report("mxfp8x1 Q (kernel rule) dequantized to float32 is exact (the source of the -q8 rows)", torch.equal(qd8.float().double(), qd8))
+        # the scale itself, exhaustively over every finite non-negative bf16 and a log-uniform float32 sample: the smallest e4m3 value v with 6 * v >= amax (searchsorted on the table), clamped to [2^-9, 448]
+        tab = torch.tensor(t_e4m3[1:], dtype=torch.float64, device="cuda")                       # 2^-9 .. 448
+        am = torch.cat([torch.arange(0, 0x7F80, dtype=torch.int32, device="cuda").to(torch.int16).view(torch.bfloat16).float(),
+                        torch.exp2(torch.rand(1 << 22, generator=g, device="cuda") * 30 - 20), tab.float() * 6.0, (tab.float() * 6.0) * (1 + 2.0 ** -23), (tab.float() * 6.0) * (1 - 2.0 ** -23)])
+        want = tab[torch.searchsorted(tab * 6.0, am.double(), right=False).clamp(max=tab.numel() - 1)]
+        report("ue4m3_scale_ceil == smallest e4m3 >= amax / 6 (searchsorted on the table), all bf16 + 4M float32 + the tie neighbourhoods", torch.equal(emu.ue4m3_scale_ceil(am).double(), want), f"({am.numel()} values)")
+        # fp32 accumulation per MMA instruction: one rounding per k64 instruction for the fp4 kinds (qk_logits(accum="f32seg") vs an independent loop)
+        qa = emu.quantize_q(qn[:2, :2], "nvfp4x3pe", 4, True)
+        kc = emu.e2m1_rn(torch.randn(2, 6, 512, generator=g, device="cuda") * 2)
+        ksf = emu.e4m3_rn(torch.exp2(torch.rand(2, 6, 32, generator=g, device="cuda") * 6 - 5))
+        got = emu.qk_logits(qa, emu.Terms([kc], [ksf], 16, 64), "f32seg").cpu().numpy()
+        qd = [(v.double() * sf_.double().repeat_interleave(16, dim=-1)).cpu().numpy() for v, sf_ in zip(qa.vals, qa.sf)]
+        kd = (kc.double() * ksf.double().repeat_interleave(16, dim=-1)).cpu().numpy()
+        want = np.zeros((2, 2, 6), dtype=np.float32)
+        for b_ in range(2):
+            for h_ in range(2):
+                for t_ in range(6):
+                    acc = np.float32(0.0)
+                    for st in range(8):
+                        for i_ in range(len(qd)):
+                            acc = np.float32(acc + np.float32(float((qd[i_][b_, h_, 64 * st:64 * st + 64] * kd[b_, t_, 64 * st:64 * st + 64]).sum())))
+                    want[b_, h_, t_] = acc
+        report("qk_logits(f32seg) of the fp4 kinds: one fp32 rounding per k64 instruction == independent loop", np.array_equal(got, want), f"({int((got != want).sum())} of {want.size} differ)")
         # the prescale only moves the ue4m3 scale floor: x6 with it must be much more accurate than x6 without it, and 'pa' must never clip (error bounded by the last term)
         e_plain = ((emu.quantize_q(q, "nvfp4x6").dense() - q.double()).norm() / q.double().norm()).item()
         e_pa = ((emu.quantize_q(q, "nvfp4x6pa").dense() - q.double()).norm() / q.double().norm()).item()
@@ -773,6 +913,12 @@ def selftest_framework(verbose: bool = True) -> bool:
         ("fp8+fp4", "nvfp4x1 full + rz", emu.Mode(fp8=mx["fp8"], fp4=OM("nvfp4x1", "native", "rebase", "x1"), p="e4m3x1", rebase_round="rz")),
         ("mxfp4", "mxfp4x2 QK, rebase", emu.Mode(mxfp4=OM("mxfp4x2", "native", "rebase"), fp8=mx["fp8"], p="e4m3x2")),
         ("fp8+mxfp4", "mxfp8x2 + p bf16 + rebase", emu.Mode(**x2)),
+        ("fp8+fp4", "P3 mxfp8 step 1 (3 NVFP4 Q terms with the exponent prescale, V direct d1, B32, kernel Q rules)",
+         emu.Mode(fp8=mx["fp8"], fp4=OM("nvfp4x3pe", "native", "rebase", "d1"), p="e4m3x1", B=32, q_kernel_rule=True)),
+        ("fp8+fp4", "P3 fp8x2 control (4 NVFP4 Q terms with the prescale 'pa', V direct hi + lo d2, P x2, B32)",
+         emu.Mode(fp8=x2["fp8"], fp4=OM("nvfp4x4pa", "native", "rebase", "d2"), p="e4m3x2", B=32, q_kernel_rule=True)),
+        ("fp8+fp4", "P3 q8 source (2 NVFP4 Q terms from the mxfp8x1 Q, prescale 'pe', V d1, B32)",
+         emu.Mode(fp8=mx["fp8"], fp4=dataclasses.replace(OM("nvfp4x2pe", "native", "rebase", "d1"), q_src="mxfp8x1"), p="e4m3x1", B=32, q_kernel_rule=True)),
         ("fp8+fp8", "exact", emu.Mode()),
         ("fp8+fp4", "k8x2 / v8x2 with lolo", emu.Mode(**ops8(q="mxfp8x2", k4="k8x2", v8="x2"), p="e4m3x2", lolo=True)),
         ("fp8+fp8", "P2 kernel parameters (Q x2, P x2, B32, kernel Q rule; f64 accumulation, the slow reference has no f32seg)", emu.Mode(**ops8(q="mxfp8x2"), p="e4m3x2", B=32, q_kernel_rule=True)),
