@@ -8,7 +8,9 @@
 // and checks every conversion bit for bit against a host reference.
 //
 // Methods (METH): REBASE = copy of the rebase of the kernel (e4m3 tile, the baseline); LDM = ldmatrix.m16n16.trans.b8 of
-// the raw rows (fp8 source), exact fp32 arithmetic, the 'ceil' scale rule of nvfp4_scale_codes.
+// the raw rows (fp8 source), exact fp32 arithmetic, the 'ceil' scale rule of nvfp4_scale_codes (v1 = first version, v2 = the
+// optimised one: reciprocal table, two dims per scale step, cheaper factors); NT = ldmatrix.m8n8.x4.trans.b16 of the nibble rows
+// (fp4 extra and mxfp4 sources) plus a 4x4 byte transpose (PRMT) and nibble shuffles.
 //
 // Build: nvcc -O3 -std=c++17 -gencode arch=compute_120a,code=sm_120a -o vt_nvfp4 vt_nvfp4.cu
 // Run:   ./vt_nvfp4 test            correctness against the host reference (all methods)
@@ -18,8 +20,8 @@
 
 using namespace t09;
 
-enum Meth { M_REBASE = 0, M_LDM = 1, M_COUNT };
-inline const char *meth_name(int m) { return m == M_REBASE ? "rebase" : "ldm"; }
+enum Meth { M_REBASE = 0, M_LDM = 1, M_LDM2 = 2, M_NT = 3, M_COUNT };
+inline const char *meth_name(int m) { return m == M_REBASE ? "rebase" : m == M_LDM ? "ldm.v1" : m == M_LDM2 ? "ldm.v2" : "nt"; }
 
 // ---------------------------------------------------------------------------------------------
 // The baseline: the rebase of the kernels, copied (mxfp8.cu rebase_tile_part / rebase_fp4_tile_part with PAIRED_V = false,
@@ -239,9 +241,161 @@ __device__ __forceinline__ void convert_fp8_ldm(const uint8_t *raw, uint8_t *vt,
 }
 
 // ---------------------------------------------------------------------------------------------
+// v2 of the same: what cost most in v1 is gone. __frcp_rn (a slow-path call) is a table of the 126 reciprocals in shared memory
+// (filled with __frcp_rn, so the values are identical); the amax / scale / quantize of two dims share one pass (quant_pair); the
+// token factors are one IMAD plus a PRMT mask each and need no clamp (invalid tokens are masked to 0).
+// ---------------------------------------------------------------------------------------------
+template <int L>
+__device__ __forceinline__ void convert_fp8_ldm2(const uint8_t *raw, uint8_t *vt, int hh, uint32_t valid, const int *e1, uint32_t lut_s, int gb, int ge) {
+    static_assert(L == 0);
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const uint32_t raw_s = smem_addr(raw), vt_s = smem_addr(vt);
+    const uint32_t ldm_addr = raw_s + fp8_off(tok_of(lane >> 4, (lane & 15) >> 2, lane & 3));
+    // exponent rows of the thread's tokens (i, j): group 4 i + t, row (j + t) & 3 of the group
+    uint32_t eb[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) eb[j] = raw_s + 512 + t * GROUP_STRIDE + ((j + t) & 3) * FP8_ROW;
+    uint32_t vm[2] = {0, 0};
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) vm[i] |= (((valid >> tok_of(i, t, j)) & 1u) ? 0xffu : 0u) << (8 * j);
+    // dim d = 16 (2 G + ch) + 8 h + g
+    const uint32_t st_data = vt_s + 32 * g + ((hh ^ ((g >> 2) & 1)) << 4) + 4 * t;
+    const uint32_t st_scale = vt_s + vt_data_bytes<L>() + 16 * g + 2 * hh + (t >> 1);
+#pragma unroll 1
+    for (int G = gb; G < ge; ++G) {
+        const uint32_t shift_bits = uint32_t(-e1[G]) << 23;
+        float f[2][4];
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t e = lds8(eb[j] + i * 4 * GROUP_STRIDE + G);
+                const uint32_t mask = __byte_perm(vm[i], 0, 0x1111u * (8 + j));  // 0xffffffff if token valid
+                f[i][j] = __uint_as_float((e * 0x800000u + shift_bits) & mask);
+            }
+#pragma unroll
+        for (int ch = 0; ch < 2; ++ch) {
+            uint32_t R[4];
+            ldmatrix_x2_trans_b8(R, ldm_addr + 16 * (2 * G + ch));
+            float x[2][8];
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const uint32_t b = R[2 * i + h] & vm[i];
+                    const uint32_t lo = e4m3x2_to_f16x2(b & 0xffffu), hi = e4m3x2_to_f16x2(b >> 16);
+                    x[h][4 * i + 0] = f16lo_to_f32(lo) * f[i][0];
+                    x[h][4 * i + 1] = f16hi_to_f32(lo) * f[i][1];
+                    x[h][4 * i + 2] = f16lo_to_f32(hi) * f[i][2];
+                    x[h][4 * i + 3] = f16hi_to_f32(hi) * f[i][3];
+                }
+            uint32_t w0, w1, codes;
+            quant_pair(x[0], x[1], lut_s, w0, w1, codes);
+            sts32(st_data + 1024 * G + 512 * ch, w0);
+            sts32(st_data + 1024 * G + 512 * ch + 256, w1);
+            if (!(t & 1)) {
+                sts8(st_scale + 128 * G + 8 * ch, codes & 0xffu);
+                sts8(st_scale + 128 * G + 8 * ch + 4, codes >> 8);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// V^T NVFP4 from nibble rows (the fp4 extra cache and the mxfp4 cache) with ldmatrix.m8n8.x4.trans.b16
+//
+// One ldmatrix.x4.trans per 32-dim group: matrix m = the 8 tokens 8 m .. 8 m + 7, a 16 B row = 32 dims of a token. Thread (g, t)
+// gets in register m the dims 4 g .. 4 g + 3 of the tokens 8 m + 2 t (low half) and 8 m + 2 t + 1 (high half). A 4x4 byte transpose
+// (8 PRMT) and nibble masks / shifts make the 4 words W[n] (n = dim 4 g + n of the group): nibble 2 m + c = that dim of the token
+// 8 m + 2 t + c, which is the V^T word t of ORDER_NAT, so the quantization needs only the partner thread (t ^ 1) for the amax of
+// its block of 16 tokens.
+// fp4: value = e2m1 * e4m3 scale (per token and 16 dims; exact in an f16 fma); mx: value = e2m1 * 2^(e - 127 - E1).
+// ---------------------------------------------------------------------------------------------
+template <int SRC, int L>
+__device__ __forceinline__ void convert_nt(const uint8_t *raw, uint8_t *vt, int hh, uint32_t valid, const int *e1, uint32_t lut_s, int gb, int ge) {
+    static_assert(SRC == SRC_FP4 || SRC == SRC_MX);
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const uint32_t raw_s = smem_addr(raw), vt_s = smem_addr(vt);
+    const int tok_l = 8 * (lane >> 3) + (lane & 7);
+    const uint32_t ldm = raw_s + (SRC == SRC_FP4 ? fp4_off(tok_l) : mx_off(tok_l));
+    constexpr int MSTEP = SRC == SRC_FP4 ? 4352 : 2176, CSTEP = SRC == SRC_FP4 ? 304 : 272;
+    const uint32_t sbase = raw_s + 256 + (SRC == SRC_FP4 ? (t >> 1) * (2176 + 64) + 2 * (t & 1) * 304 : 2 * t * 272);
+    // nibble mask: nibble 2 m + c <- token 8 m + 2 t + c
+    uint32_t nm = 0;
+    {
+        const uint32_t v2 = valid >> (2 * t);
+#pragma unroll
+        for (int m = 0; m < 4; ++m)
+#pragma unroll
+            for (int c = 0; c < 2; ++c) nm |= ((v2 >> (8 * m + c)) & 1u) ? (0xFu << (4 * (2 * m + c))) : 0u;
+    }
+#pragma unroll 1
+    for (int G = gb; G < ge; ++G) {
+        uint32_t R[4];
+        ldmatrix_x4_trans(R, ldm + 16 * G);
+        const uint32_t t0 = __byte_perm(R[0], R[1], 0x5140), t1 = __byte_perm(R[2], R[3], 0x5140);
+        const uint32_t t2 = __byte_perm(R[0], R[1], 0x7362), t3 = __byte_perm(R[2], R[3], 0x7362);
+        // U[0] = byte 0 of R[0..3], U[1] = byte 1, U[2] = byte 2, U[3] = byte 3 (byte m from R[m])
+        const uint32_t U[4] = {__byte_perm(t0, t1, 0x5410), __byte_perm(t0, t1, 0x7632), __byte_perm(t2, t3, 0x5410), __byte_perm(t2, t3, 0x7632)};
+        uint32_t W[4];
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            W[2 * p] = (((U[p] & 0x0F0F0F0Fu) | ((U[2 + p] << 4) & 0xF0F0F0F0u))) & nm;
+            W[2 * p + 1] = ((((U[p] >> 4) & 0x0F0F0F0Fu) | (U[2 + p] & 0xF0F0F0F0u))) & nm;
+        }
+        uint32_t sc2[4];
+        float fac[8];
+        if constexpr (SRC == SRC_FP4) {
+            const int B = 2 * G + (g >> 2);
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                const uint32_t lo = min(lds8(sbase + m * MSTEP + B) & 0x7fu, 0x7eu), hi = min(lds8(sbase + m * MSTEP + CSTEP + B) & 0x7fu, 0x7eu);
+                sc2[m] = e4m3x2_to_f16x2(lo | (hi << 8));
+            }
+        } else {
+            const int shift = e1[G];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                // finite for invalid tokens too (their nibbles are masked to 0): clamp the exponent
+                const int ee = int(lds8(sbase + (j >> 1) * MSTEP + (j & 1) * CSTEP + G)) - shift;
+                fac[j] = __uint_as_float(uint32_t(min(max(ee, 1), 254)) << 23);
+            }
+        }
+#pragma unroll
+        for (int pp = 0; pp < 2; ++pp) {
+            float x[2][8];
+#pragma unroll
+            for (int s = 0; s < 2; ++s)
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+                    const uint32_t v = e2m1x2_to_f16x2(W[2 * pp + s] >> (8 * m));
+                    if constexpr (SRC == SRC_FP4) {
+                        x[s][2 * m] = hmul_f32<0>(v, sc2[m]);
+                        x[s][2 * m + 1] = hmul_f32<1>(v, sc2[m]);
+                    } else {
+                        x[s][2 * m] = f16lo_to_f32(v) * fac[2 * m];
+                        x[s][2 * m + 1] = f16hi_to_f32(v) * fac[2 * m + 1];
+                    }
+                }
+            uint32_t w0, w1, codes;
+            quant_pair(x[0], x[1], lut_s, w0, w1, codes);
+            const int d0 = 32 * G + 4 * g + 2 * pp;
+            sts32(vt_s + vt_data_off<L>(d0, hh) + 4 * t, w0);
+            sts32(vt_s + vt_data_off<L>(d0 + 1, hh) + 4 * t, w1);
+            if (!(t & 1)) {
+                sts8(vt_s + vt_scale_off<L>(d0) + 2 * hh + (t >> 1), codes & 0xffu);
+                sts8(vt_s + vt_scale_off<L>(d0 + 1) + 2 * hh + (t >> 1), codes >> 8);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------------------------
-constexpr int VT_L = 0;                                  // the V^T layout of the conversion benchmarks
+constexpr int VT_L = 0;                                 // the V^T layout of the conversion benchmarks
 constexpr int VT_BYTES = vt_buf_bytes<VT_L>();           // 18432 per pair of tiles
 constexpr int V_E4M3_BYTES = TILE * DIMS;                // 16384 per rebased tile
 
@@ -254,7 +408,7 @@ template <int W> __device__ __forceinline__ void group_range(int cw, int &gb, in
 // Convert tile `raw` (valid mask `valid`) into half `hh` of the pair buffer `vt` (or, for REBASE, into the e4m3 buffer
 // vt + slot * (V_E4M3_BYTES + 64) with its 16 group exponents behind it)
 template <int SRC, int METH, int W>
-__device__ __forceinline__ void convert_tile(const uint8_t *raw, uint8_t *vt, int hh, uint32_t valid, const int *e1, int cw) {
+__device__ __forceinline__ void convert_tile(const uint8_t *raw, uint8_t *vt, int hh, uint32_t valid, const int *e1, uint32_t lut_s, int cw) {
     int gb, ge;
     group_range<W>(cw, gb, ge);
     if constexpr (METH == M_REBASE) {
@@ -265,12 +419,17 @@ __device__ __forceinline__ void convert_tile(const uint8_t *raw, uint8_t *vt, in
         else base::rebase_mx(raw, dst, vscale, valid, gb, ge);
     } else if constexpr (METH == M_LDM && SRC == SRC_FP8) {
         convert_fp8_ldm<VT_L>(raw, vt, hh, valid, e1, gb, ge);
+    } else if constexpr (METH == M_LDM2 && SRC == SRC_FP8) {
+        convert_fp8_ldm2<VT_L>(raw, vt, hh, valid, e1, lut_s, gb, ge);
+    } else if constexpr (METH == M_NT && (SRC == SRC_FP4 || SRC == SRC_MX)) {
+        convert_nt<SRC, VT_L>(raw, vt, hh, valid, e1, lut_s, gb, ge);
     }
 }
 
 constexpr bool supported(int src, int meth) {
-    return meth == M_REBASE || (meth == M_LDM && src == SRC_FP8);
+    return meth == M_REBASE || ((meth == M_LDM || meth == M_LDM2) && src == SRC_FP8) || (meth == M_NT && (src == SRC_FP4 || src == SRC_MX));
 }
+constexpr int order_of(int meth) { return meth == M_NT ? ORDER_NAT : ORDER_LDM; }
 
 // ---------------------------------------------------------------------------------------------
 // Test kernel: one block per pair of tiles, converts with W converter warps (warps 12 - W .. 11), dumps the pair buffer
@@ -280,7 +439,7 @@ constexpr int OFF_RAW = 0;                               // 2 raw tiles
 constexpr int OFF_VT = 2 * RAW_BYTES;                    // 2 pair buffers (REBASE: 2 e4m3 buffers)
 constexpr int OFF_GATHER = OFF_VT + 2 * VT_BYTES;        // a scratch tile for the gather warp
 constexpr int OFF_MISC = OFF_GATHER + RAW_BYTES;
-constexpr int SMEM_BYTES = OFF_MISC + 512;
+constexpr int SMEM_BYTES = OFF_MISC + 1024;
 
 struct Misc {
     uint32_t valid[2];
@@ -288,6 +447,7 @@ struct Misc {
     uint32_t stop;
     uint32_t pad;
     uint64_t gather_bar;
+    float rcp_lut[128];      // __frcp_rn of the e4m3 value of each scale code (0 outside 1..126)
 };
 
 template <int SRC, int METH, int W>
@@ -298,6 +458,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) vt_test(const uint8_t *images, co
     for (int i = threadIdx.x; i < 2 * RAW_BYTES / 16; i += NTHREADS)
         reinterpret_cast<uint4 *>(smem + OFF_RAW)[i] = reinterpret_cast<const uint4 *>(images + size_t(pair) * 2 * RAW_BYTES)[i];
     for (int i = threadIdx.x; i < 2 * VT_BYTES / 4; i += NTHREADS) reinterpret_cast<uint32_t *>(smem + OFF_VT)[i] = 0xa5a5a5a5u;
+    if (threadIdx.x < 128) misc.rcp_lut[threadIdx.x] = (threadIdx.x >= 1 && threadIdx.x <= 126) ? __frcp_rn(f16lo_to_f32(e4m3x2_to_f16x2(threadIdx.x))) : 0.f;
     if (threadIdx.x < 2) misc.valid[threadIdx.x] = valids[pair * 2 + threadIdx.x];
     if (threadIdx.x < NGROUPS) misc.e1[threadIdx.x] = e1s[pair * NGROUPS + threadIdx.x];
     __syncthreads();
@@ -305,7 +466,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) vt_test(const uint8_t *images, co
     if (warp >= 12 - W) {
 #pragma unroll 1
         for (int hh = 0; hh < 2; ++hh)
-            convert_tile<SRC, METH, W>(smem + OFF_RAW + hh * RAW_BYTES, smem + OFF_VT, hh, misc.valid[hh], misc.e1, warp - (12 - W));
+            convert_tile<SRC, METH, W>(smem + OFF_RAW + hh * RAW_BYTES, smem + OFF_VT, hh, misc.valid[hh], misc.e1, smem_addr(misc.rcp_lut), warp - (12 - W));
     }
     __syncthreads();
     for (int i = threadIdx.x; i < VT_BYTES / 16; i += NTHREADS)
@@ -409,6 +570,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) vt_bench(const __grid_constant__ 
     for (int i = threadIdx.x; i < 2 * RAW_BYTES / 16; i += NTHREADS)
         reinterpret_cast<uint4 *>(smem + OFF_RAW)[i] = reinterpret_cast<const uint4 *>(p.images)[i];
     for (int i = threadIdx.x; i < 2 * VT_BYTES / 16; i += NTHREADS) reinterpret_cast<uint4 *>(smem + OFF_VT)[i] = uint4{0x38383838u, 0x38383838u, 0x38383838u, 0x38383838u};
+    if (threadIdx.x < 128) misc.rcp_lut[threadIdx.x] = (threadIdx.x >= 1 && threadIdx.x <= 126) ? __frcp_rn(f16lo_to_f32(e4m3x2_to_f16x2(threadIdx.x))) : 0.f;
     if (threadIdx.x < 2) misc.valid[threadIdx.x] = p.valids[threadIdx.x];
     if (threadIdx.x < NGROUPS) misc.e1[threadIdx.x] = p.e1[threadIdx.x];
     if (threadIdx.x == 0) {
@@ -445,7 +607,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) vt_bench(const __grid_constant__ 
 #pragma unroll 1
             for (int tile = 0; tile < p.ntiles; ++tile) {
                 const int slot = tile & 1;
-                convert_tile<SRC, METH, W>(smem + OFF_RAW + slot * RAW_BYTES, smem + OFF_VT, slot, misc.valid[slot], misc.e1, cw);
+                convert_tile<SRC, METH, W>(smem + OFF_RAW + slot * RAW_BYTES, smem + OFF_VT, slot, misc.valid[slot], misc.e1, smem_addr(misc.rcp_lut), cw);
                 const long long now = clock64_();
                 if (lane == 0) dt[tile] = uint32_t(now - prev);
                 prev = now;
@@ -472,7 +634,7 @@ template <int SRC, int METH, int W> bool run_test(int pairs_per_scenario) {
     for (int p = 0; p < npairs; ++p) {
         const int sc = p % SC_COUNT;
         int e1[NGROUPS];
-        make_e1(sc, 7777ull * p + 3, e1);
+        make_e1(sc, 7777ull * p + 3, e1, SRC == SRC_FP4);
         for (int hh = 0; hh < 2; ++hh) {
             RawTile tile;
             make_tile(tile, SRC, sc, 1000003ull * p + 17 * hh + 5);
@@ -480,7 +642,7 @@ template <int SRC, int METH, int W> bool run_test(int pairs_per_scenario) {
             valids[p * 2 + hh] = tile.valid;
             std::vector<float> x;
             shifted_values(tile, e1, x);
-            vt_reference(x, tile.valid, refs[p * 2 + hh]);
+            vt_reference(x, tile.valid, refs[p * 2 + hh], order_of(METH));
         }
         std::memcpy(&e1s[p * NGROUPS], e1, sizeof(e1));
     }
@@ -745,6 +907,12 @@ int main(int argc, char **argv) {
         test_rules();
         run_test<SRC_FP8, M_LDM, 3>(60);
         run_test<SRC_FP8, M_LDM, 4>(30);
+        run_test<SRC_FP8, M_LDM2, 3>(60);
+        run_test<SRC_FP8, M_LDM2, 4>(30);
+        run_test<SRC_FP4, M_NT, 3>(60);
+        run_test<SRC_FP4, M_NT, 4>(30);
+        run_test<SRC_MX, M_NT, 3>(60);
+        run_test<SRC_MX, M_NT, 4>(30);
         printf(g_failures ? "FAILED\n" : "ALL OK\n");
         return g_failures != 0;
     }
@@ -756,6 +924,9 @@ int main(int argc, char **argv) {
         run_bench_all<SRC_FP4, M_REBASE>();
         run_bench_all<SRC_MX, M_REBASE>();
         run_bench_all<SRC_FP8, M_LDM>();
+        run_bench_all<SRC_FP8, M_LDM2>();
+        run_bench_all<SRC_FP4, M_NT>();
+        run_bench_all<SRC_MX, M_NT>();
         return 0;
     }
     return 0;

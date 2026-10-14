@@ -197,6 +197,55 @@ __device__ __forceinline__ long long clock64_() {
     return t;
 }
 
+
+// f32 = a.h * b.h (the exact product of two f16 halves, fma.rn.f32.f16 of sm_100+), H = 0 / 1: low / high half. The addend is -0
+// so that a -0 product stays -0 (+0 would turn it into +0; the e2m1 code of -0 is 0x8)
+template <int H> __device__ __forceinline__ float hmul_f32(uint32_t a2, uint32_t b2) {
+    float r;
+    if constexpr (H == 0)
+        asm("{ .reg .b16 a0, a1, b0, b1; mov.b32 {a0, a1}, %1; mov.b32 {b0, b1}, %2; fma.rn.f32.f16 %0, a0, b0, 0f80000000; }\n" : "=f"(r) : "r"(a2), "r"(b2));
+    else
+        asm("{ .reg .b16 a0, a1, b0, b1; mov.b32 {a0, a1}, %1; mov.b32 {b0, b1}, %2; fma.rn.f32.f16 %0, a1, b1, 0f80000000; }\n" : "=f"(r) : "r"(a2), "r"(b2));
+    return r;
+}
+// byte M of w (two e2m1, low nibble first) -> two f16
+template <int M> __device__ __forceinline__ uint32_t e2m1_byte_f16x2(uint32_t w) {
+    uint32_t r;
+    if constexpr (M == 0) asm("{ .reg .b8 b0, b1, b2, b3; mov.b32 {b0, b1, b2, b3}, %1; cvt.rn.f16x2.e2m1x2 %0, b0; }\n" : "=r"(r) : "r"(w));
+    else if constexpr (M == 1) asm("{ .reg .b8 b0, b1, b2, b3; mov.b32 {b0, b1, b2, b3}, %1; cvt.rn.f16x2.e2m1x2 %0, b1; }\n" : "=r"(r) : "r"(w));
+    else if constexpr (M == 2) asm("{ .reg .b8 b0, b1, b2, b3; mov.b32 {b0, b1, b2, b3}, %1; cvt.rn.f16x2.e2m1x2 %0, b2; }\n" : "=r"(r) : "r"(w));
+    else asm("{ .reg .b8 b0, b1, b2, b3; mov.b32 {b0, b1, b2, b3}, %1; cvt.rn.f16x2.e2m1x2 %0, b3; }\n" : "=r"(r) : "r"(w));
+    return r;
+}
+__device__ __forceinline__ uint32_t lds_u32(uint32_t addr) { return lds32(addr); }
+__device__ __forceinline__ float lds_f32(uint32_t addr) {
+    float v;
+    asm volatile("ld.shared.f32 %0, [%1];\n" : "=f"(v) : "r"(addr));
+    return v;
+}
+
+// Two dims at once (8 values each, index = nibble): amax with the partner thread (xor 1), the scale codes, and the e2m1 words.
+// `lut_s` is the shared address of the table of __frcp_rn(scale) by code.
+__device__ __forceinline__ void quant_pair(const float (&xa)[8], const float (&xb)[8], uint32_t lut_s, uint32_t &wa, uint32_t &wb, uint32_t &codes) {
+    float aa = 0.f, ab = 0.f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        aa = fmaxf(aa, fabsf(xa[k]));
+        ab = fmaxf(ab, fabsf(xb[k]));
+    }
+    aa = fmaxf(aa, __shfl_xor_sync(0xffffffffu, aa, 1));
+    ab = fmaxf(ab, __shfl_xor_sync(0xffffffffu, ab, 1));
+    codes = nvfp4_scale_codes(aa, ab);
+    const float inva = lds_f32(lut_s + 4 * (codes & 0xffu)), invb = lds_f32(lut_s + 4 * (codes >> 8));
+    wa = 0;
+    wb = 0;
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        wa |= f32x2_to_e2m1x2(xa[2 * p] * inva, xa[2 * p + 1] * inva) << (8 * p);
+        wb |= f32x2_to_e2m1x2(xb[2 * p] * invb, xb[2 * p + 1] * invb) << (8 * p);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Host side: element formats, the quantization rules and a reference of the conversions
 // ---------------------------------------------------------------------------------------------
@@ -288,8 +337,9 @@ inline uint8_t pick_nib(Rng &r, int sc) {
 
 // Fill `t` with a tile of source format `src` and scenario `sc`. make_e1 draws the first-level shifts E1 (per 32-dim group;
 // the tiles of a CTA share them). Scales are chosen so that every value times 2^-E1 is a normal float or zero.
-inline void make_e1(int sc, uint64_t seed, int (&e1)[NGROUPS]) {
+inline void make_e1(int sc, uint64_t seed, int (&e1)[NGROUPS], bool zero = false) {
     Rng r(seed ^ 0x9e3779b97f4a7c15ull);
+    if (zero) { for (int g = 0; g < NGROUPS; ++g) e1[g] = 0; return; }
     for (int g = 0; g < NGROUPS; ++g) e1[g] = (sc == SC_RANDOM || sc == SC_OUTLIER) ? int(r.below(7)) - 3 : (sc == SC_BIG || sc == SC_TINY ? 0 : int(r.below(5)) - 2);
 }
 
@@ -375,33 +425,37 @@ inline void shifted_values(const RawTile &t, const int (&e1)[NGROUPS], std::vect
         }
 }
 
-// Expected V^T of one tile: data[d][4 words] and scale codes sc[d][2]  (block q = (tok >> 3) & 1)
+// Token orders of the nibbles of a V^T word: ORDER_LDM (nibble 4 i + j of word t = tok_of(i, t, j), what the ldmatrix.trans.b8
+// route of the fp8 rows produces) and ORDER_NAT (nibble 2 m + c of word t = token 8 m + 2 t + c, the order of the S
+// accumulators of an unpermuted QK, what the ldmatrix.trans.b16 route of the nibble rows produces). Block q = word 2q, 2q+1.
+enum Order { ORDER_LDM = 0, ORDER_NAT = 1 };
+HD inline int tok_of_order(int order, int t, int nib) { return order == ORDER_LDM ? tok_of(nib >> 2, t, nib & 3) : 8 * (nib >> 1) + 2 * t + (nib & 1); }
+
+// Expected V^T of one tile: data[d][4 words] and scale codes sc[d][2]
 struct VtRef {
     std::vector<uint32_t> data;   // [512][4]
     std::vector<uint8_t> scale;   // [512][2]
     VtRef() : data(DIMS * 4, 0), scale(DIMS * 2, 0) {}
 };
-inline void vt_reference(const std::vector<float> &x, uint32_t valid, VtRef &ref) {
+inline void vt_reference(const std::vector<float> &x, uint32_t valid, VtRef &ref, int order) {
     for (int d = 0; d < DIMS; ++d)
         for (int q = 0; q < 2; ++q) {
             float amax = 0.f;
             for (int t = 2 * q; t < 2 * q + 2; ++t)
-                for (int i = 0; i < 2; ++i)
-                    for (int j = 0; j < 4; ++j) {
-                        const int tok = tok_of(i, t, j);
-                        if ((valid >> tok) & 1) amax = std::max(amax, std::fabs(x[tok * DIMS + d]));
-                    }
+                for (int m = 0; m < 8; ++m) {
+                    const int tok = tok_of_order(order, t, m);
+                    if ((valid >> tok) & 1) amax = std::max(amax, std::fabs(x[tok * DIMS + d]));
+                }
             const uint32_t code = h_scale_code(amax);
             const float inv = h_rcp(code);
             ref.scale[d * 2 + q] = uint8_t(code);
             for (int t = 2 * q; t < 2 * q + 2; ++t) {
                 uint32_t word = 0;
-                for (int i = 0; i < 2; ++i)
-                    for (int j = 0; j < 4; ++j) {
-                        const int tok = tok_of(i, t, j);
-                        const uint32_t nib = ((valid >> tok) & 1) ? h_e2m1_rne(x[tok * DIMS + d] * inv) : 0u;
-                        word |= nib << (4 * (4 * i + j));
-                    }
+                for (int m = 0; m < 8; ++m) {
+                    const int tok = tok_of_order(order, t, m);
+                    const uint32_t nib = ((valid >> tok) & 1) ? h_e2m1_rne(x[tok * DIMS + d] * inv) : 0u;
+                    word |= nib << (4 * m);
+                }
                 ref.data[d * 4 + t] = word;
             }
         }
