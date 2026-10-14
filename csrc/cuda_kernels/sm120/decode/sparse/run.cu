@@ -54,8 +54,9 @@ void run_sparse_decode(const SparseAttnDecodeParams &params) {
     }
 
     const Arithmetic arithmetic = get_arithmetic();
-    const bool is_all_fp8 = params.extra_topk == 0 || params.extra_model_type == ModelType::V41;
-    if (arithmetic == Arithmetic::BF16 || !is_all_fp8) {
+    const bool is_extra_fp4 = params.extra_topk > 0 && params.extra_model_type == ModelType::V41_FP4;
+    // fp8x2 has no fp4 extra cache path: one e4m3 term of V on an fp4 tile is outside the tolerance of the upstream tests
+    if (arithmetic == Arithmetic::BF16 || (arithmetic == Arithmetic::FP8X2 && is_extra_fp4)) {
         run_bf16(params);
     } else {
         run_mxfp8(params, arithmetic == Arithmetic::FP8X2 ? 2 : 1);

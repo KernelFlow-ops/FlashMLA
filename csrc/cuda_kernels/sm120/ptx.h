@@ -110,6 +110,28 @@ __device__ __forceinline__ void mma_m16n8k32_mxf8(float (&d)[4], const uint32_t 
                    "r"(sfa), "h"(byte_a), "h"(thread_a), "r"(sfb), "h"(byte_b), "h"(thread_b));
 }
 
+// d[16x8] += (a[16x64] * sa) * (b[64x8] * sb): e2m1 inputs with an e4m3 scale (read as unsigned) for every 16 elements of
+// k of each row of A and column of B, and an fp32 accumulator; twice the rate of the block-scaled e4m3 MMA. Eight elements
+// per register, the first in the low nibble: thread (g, t) holds a[i] = A(g + 8*(i&1), 32*(i>>1) + 8t .. +7),
+// b0 / b1 = B(8t .. +7 / 32 + 8t .. +7, g), and d as for bf16. Byte i of a scale register covers k [16i, +16): row m takes
+// the `sfa` register of thread 4*(m%8) + 2*THREAD_A + (m >= 8), column n the `sfb` register of thread 4*n + THREAD_B.
+template<int THREAD_A, int THREAD_B>
+__device__ __forceinline__ void mma_m16n8k64_nvf4(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1, uint32_t sfa, uint32_t sfb) {
+    static constexpr uint16_t byte_id = 0, thread_a = THREAD_A, thread_b = THREAD_B;
+    asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1),
+                   "r"(sfa), "h"(byte_id), "h"(thread_a), "r"(sfb), "h"(byte_id), "h"(thread_b));
+}
+
+// Two fp32 values -> two e2m1 values in one byte (`lo` in the low nibble), round to nearest, saturating
+__device__ __forceinline__ uint32_t f32x2_to_e2m1x2(float lo, float hi) {
+    uint32_t result;
+    asm("{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %1, %2; cvt.u32.u8 %0, t; }\n" : "=r"(result) : "f"(hi), "f"(lo));
+    return result;
+}
+
 // Two fp32 values -> two e4m3 values (`lo` in the low byte), round to nearest, saturating
 __device__ __forceinline__ uint32_t f32x2_to_e4m3x2(float lo, float hi) {
     uint16_t result;
