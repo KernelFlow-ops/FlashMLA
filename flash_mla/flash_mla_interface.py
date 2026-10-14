@@ -113,10 +113,12 @@ def flash_mla_with_kvcache(
 
     For DeepSeek V4.1:
         head_dim should be 512 while head_dim_v should be 512.
-        The format is detected from the last dimension of `k_cache` (i.e. the bytes per token): 528 (V4.1 fp8) or 288 (V4.1 fp4, only valid for an extra cache next to a V4.1 fp8 main cache).
-        In both, each token stores its quantized raw data first, followed immediately by its scales:
+        The format is detected from the last dimension of `k_cache` (i.e. the bytes per token): 528 (V4.1 fp8) or 288 (V4.1 fp4, only valid for an extra cache next to a V4.1 fp8 main cache;
+        on sm120 also as the main cache, with a V4.1 fp4 extra cache or none). On sm120 there is also 272 (MXFP4, as the main cache with an MXFP4 extra cache or none).
+        In all of them, each token stores its quantized raw data first, followed immediately by its scales:
             - V4.1 (528 Bytes per token): the raw data is 512 float8_e4m3 values, i.e. all 512 dimensions are quantized, including the 64 RoPE ones, so there is no bfloat16 part; the trailing scales are 16 Bytes of float8_e8m0 values, each covering 32 consecutive float8_e4m3 values.
             - V4.1 fp4 (288 Bytes per token): the raw data is 256 Bytes containing 512 e2m1 values (2 values per byte, the even-indexed one in the low nibble); the trailing scales are 32 Bytes of float8_e4m3 values, each covering 16 consecutive e2m1 values.
+            - MXFP4 (272 Bytes per token, sm120 only): the raw data is packed as in V4.1 fp4; the trailing scales are 16 Bytes of float8_e8m0 values, each covering 32 consecutive e2m1 values.
         See tests/quant.py for quantization and dequantization details.
 
     Return:

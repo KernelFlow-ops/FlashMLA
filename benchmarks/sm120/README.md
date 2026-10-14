@@ -85,3 +85,22 @@ does the same for two eager runs.
   lists the kernels of the graph nodes.
 * `--only <substr,...>`, `--list`, `--repeats`, `--block-ms`, `--bf16-tflops`, `--gather-gbps`, `--no-graph`, `--no-kineto`.
 * The exit code is 2 if any shape is not bit-identical (graph vs eager, or eager vs eager).
+
+## `bench_formats.py` - every KV cache format and mode against each other
+
+Times the decode kernel for every cache format and precision mode on the production shapes of `tests/test-sparse-decode.py`
+(h in {64, 128} x b in {64, 128, 256, 512}, s_q 4, topk 128 + extra 512; and b 1, s_q 4096), with the upstream test's method (kineto,
+8 GB L2 flush before every call). Per shape it generates the data of every format first and then goes over the configs in rounds,
+so that all configs of a round see the same clocks and L2 state. The tables of `docs/sm120/README.md` come from it.
+
+```bash
+# exclusive GPU; lib / quant come from this tree's tests/, flash_mla from PYTHONPATH
+PYTHONPATH=. python benchmarks/sm120/bench_formats.py --csv new.csv --md new.md
+# an older build with the same data generator: put it on PYTHONPATH and ask only for what it supports
+PYTHONPATH=<old tree> python benchmarks/sm120/bench_formats.py --configs fp8:bf16,fp8+fp4:bf16 --csv old.csv
+```
+
+Configs are `format:mode` with the formats `fp8` (FP8 main + FP8 extra), `fp8+fp4` (FP8 main + V4.1 FP4 extra), `mxfp4` (MXFP4 main +
+extra) and `nvfp4` (V4.1 FP4 main + extra) and the modes of `FLASH_MLA_SM120_DECODE_MODE`. Options: `--configs`, `--shapes`, `--passes`
+(rounds per process, 2), `--runs` (kk.bench calls per measurement, 10), `--csv`, `--md`, `--tag`. For a comparison of builds, alternate
+their processes (old, new, old, new) and take the medians over all samples.
