@@ -38,7 +38,8 @@ using stream_t = aclrtStream;
 
 enum class ModelType {
     V41,    // DeepSeek V4.1 (d_qk=512, RoPE fp8, tile_size=32)
-    V41_FP4     // DeepSeek V4.1 (d_qk=512, fp4 e2m1, tile_size=16, e4m3 scales)
+    V41_FP4,    // DeepSeek V4.1 (d_qk=512, fp4 e2m1, tile_size=16, e4m3 scales)
+    V41_MXFP4   // DeepSeek V4.1 (d_qk=512, OCP MX fp4: e2m1, tile_size=32, ue8m0 scales; sm120 sparse decode only)
 };
 
 enum class SparseAttnFwdMode {
@@ -125,7 +126,7 @@ struct SparseAttnDecodeParams {
     int num_blocks;             // Total number of blocks in the paged KV cache
     int page_block_size;        // Number of KV tokens per page block
     int topk;                   // Number of selected KV tokens per query
-    ModelType model_type;       // Format of `kv` (V41 or V41_FP4), see KVCacheFormat in kv_cache_format.h
+    ModelType model_type;       // Format of `kv` (V41, V41_FP4 or V41_MXFP4), see KVCacheFormat in kv_cache_format.h
     ModelType extra_model_type; // Format of `extra_kv`: model_type, or V41_FP4 next to a V41 `kv` (see is_valid_kv_format_pair)
 
     // Input tensors

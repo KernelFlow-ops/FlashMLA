@@ -207,6 +207,15 @@ protected:
 #endif  // FLASH_MLA_IS_BUILD_ON_ASCEND
 
 
+// The format of a paged KV cache by bytes per token: the V4.1 formats of detect_kv_cache_format_for_headdim_512 and the
+// MXFP4 cache (272 B/token), which only the sm120 decode kernel reads (the other implementations reject it in dispatch_kv_formats)
+static ModelType detect_sparse_decode_kv_format(int bytes_per_token) {
+    if (bytes_per_token == kv_cache_bytes_per_token(ModelType::V41_MXFP4)) {
+        return ModelType::V41_MXFP4;
+    }
+    return detect_kv_cache_format_for_headdim_512(bytes_per_token);
+}
+
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_decode_fwd(
     const at::Tensor &q,   // [b, s_q, h_q, d_qk]
@@ -328,10 +337,16 @@ sparse_decode_fwd(
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
     // The formats of `kv` and `extra_kv`
-    ModelType model_type = detect_kv_cache_format_for_headdim_512(kv.size(3));
-    ModelType extra_model_type = have_extra_kcache ? detect_kv_cache_format_for_headdim_512(extra_kv->size(3)) : model_type;
+    ModelType model_type = detect_sparse_decode_kv_format(kv.size(3));
+    ModelType extra_model_type = have_extra_kcache ? detect_sparse_decode_kv_format(extra_kv->size(3)) : model_type;
     TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
     TORCH_CHECK(is_valid_kv_format_pair(model_type, extra_model_type), "invalid kv format pair, ", get_dynamic_enum_name(model_type), " and ", get_dynamic_enum_name(extra_model_type));
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+    TORCH_CHECK((model_type != ModelType::V41_MXFP4 && extra_model_type != ModelType::V41_MXFP4) || arch.is_sm120f(),
+        "The MXFP4 KV cache (", kv_cache_bytes_per_token(ModelType::V41_MXFP4), " bytes per token) is only supported by the sm120 decoding kernel");
+#else
+    TORCH_CHECK(model_type != ModelType::V41_MXFP4 && extra_model_type != ModelType::V41_MXFP4, "The MXFP4 KV cache is only supported by the sm120 decoding kernel");
+#endif
     KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, kv_cache_bytes_per_token(model_type));
     KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, kv_cache_bytes_per_token(extra_model_type));
     TORCH_CHECK(kv.stride(1) == kv_cache_bytes_per_token(model_type), "The whole block must be contiguous when is_fp8_cache is True for kv cache");

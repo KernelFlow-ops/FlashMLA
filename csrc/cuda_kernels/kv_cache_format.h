@@ -3,20 +3,23 @@
 #include "params.h"
 
 // Each V4.1 token stores [raw data, 1-byte scales], including the RoPE dims:
-// FP8: 512 B e4m3 + 16 B ue8m0; FP4: 256 B e2m1 + 32 B e4m3. See tests/quant.py.
+// FP8: 512 B e4m3 + 16 B ue8m0; FP4: 256 B e2m1 + 32 B e4m3; MXFP4: 256 B e2m1 + 16 B ue8m0. See tests/quant.py.
+// IS_FP4 is the NVFP4-style cache (V41_FP4) only: the code of the other architectures branches on it; the MXFP4 cache (V41_MXFP4,
+// read by the sm120 decode kernel mxfp4.cu only) has IS_MXFP4.
 template<ModelType MT>
 struct KVCacheFormat {
     static constexpr ModelType MODEL_TYPE = MT;
     static constexpr bool IS_FP4 = MT == ModelType::V41_FP4;
+    static constexpr bool IS_MXFP4 = MT == ModelType::V41_MXFP4;
     static constexpr int D_QK = 512;
     static constexpr int D_ROPE = 64;
     static constexpr int D_NOPE = D_QK - D_ROPE;
-    static constexpr int D_FP4 = IS_FP4 ? D_QK : 0;    // Dimensions stored as fp4 e2m1
-    static constexpr int D_FP8 = IS_FP4 ? 0 : D_QK;    // Dimensions stored as fp8 e4m3, needing dequant
+    static constexpr int D_FP4 = (IS_FP4 || IS_MXFP4) ? D_QK : 0;    // Dimensions stored as fp4 e2m1
+    static constexpr int D_FP8 = (IS_FP4 || IS_MXFP4) ? 0 : D_QK;    // Dimensions stored as fp8 e4m3, needing dequant
     static constexpr int QUANT_TILE_SIZE = IS_FP4 ? 16 : 32;                            // Dimensions sharing one scale
-    static constexpr int NUM_SCALES_EACH_TOKEN = D_QK / QUANT_TILE_SIZE;                // 16 (V41) / 32 (fp4)
+    static constexpr int NUM_SCALES_EACH_TOKEN = D_QK / QUANT_TILE_SIZE;                // 16 (V41 / MXFP4) / 32 (fp4)
     static constexpr int QUANT_BYTES = D_FP4 / 2 + D_FP8;                               // The quantized (fp4 / fp8) data of a token
-    static constexpr int BYTES_PER_TOKEN = QUANT_BYTES + NUM_SCALES_EACH_TOKEN;   // 528 / 288
+    static constexpr int BYTES_PER_TOKEN = QUANT_BYTES + NUM_SCALES_EACH_TOKEN;   // 528 / 288 / 272
 };
 
 // A CTA's contiguous share of a token. In a pair, CTA0 loads its scales separately;
@@ -39,6 +42,7 @@ constexpr int kv_cache_bytes_per_token(ModelType mt) {
     switch (mt) {
         case ModelType::V41: return KVCacheFormat<ModelType::V41>::BYTES_PER_TOKEN;
         case ModelType::V41_FP4: return KVCacheFormat<ModelType::V41_FP4>::BYTES_PER_TOKEN;
+        case ModelType::V41_MXFP4: return KVCacheFormat<ModelType::V41_MXFP4>::BYTES_PER_TOKEN;
     }
     return 0;
 }

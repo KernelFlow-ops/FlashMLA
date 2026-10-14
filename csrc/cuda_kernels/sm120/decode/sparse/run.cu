@@ -34,8 +34,12 @@ void run_sparse_decode(const SparseAttnDecodeParams &params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.d_qk == 512);
     KU_ASSERT(params.d_v == 512);
-    KU_ASSERT(params.model_type == ModelType::V41, "the main KV cache must be the V4.1 fp8 cache");
-    KU_ASSERT(params.extra_model_type == ModelType::V41 || params.extra_model_type == ModelType::V41_FP4);
+    KU_ASSERT(params.model_type == ModelType::V41 || params.model_type == ModelType::V41_MXFP4, "the main KV cache must be the V4.1 fp8 cache or the MXFP4 cache");
+    if (params.model_type == ModelType::V41_MXFP4) {
+        KU_ASSERT(params.extra_topk == 0 || params.extra_model_type == ModelType::V41_MXFP4, "an MXFP4 main KV cache takes an MXFP4 extra cache only");
+    } else {
+        KU_ASSERT(params.extra_model_type == ModelType::V41 || params.extra_model_type == ModelType::V41_FP4);
+    }
 
     // 32-bit loads of Q and 32-bit stores of the output
     KU_ASSERT((int64_t)params.q % 4 == 0 && params.stride_q_b % 2 == 0 && params.stride_q_s_q % 2 == 0 && params.stride_q_h_q % 2 == 0,
@@ -54,6 +58,15 @@ void run_sparse_decode(const SparseAttnDecodeParams &params) {
     }
 
     const Arithmetic arithmetic = get_arithmetic();
+    if (params.model_type == ModelType::V41_MXFP4) {
+        // bf16 (the default) has no exact path for this cache: it runs the 4-term arithmetic that is within the tolerance of the bf16 one
+        if (arithmetic == Arithmetic::MXFP8) {
+            run_mxfp4(params, 2, 1);
+        } else {
+            run_mxfp4(params, 4, 2);
+        }
+        return;
+    }
     const bool is_extra_fp4 = params.extra_topk > 0 && params.extra_model_type == ModelType::V41_FP4;
     // fp8x2 has no fp4 extra cache path: one e4m3 term of V on an fp4 tile is outside the tolerance of the upstream tests
     if (arithmetic == Arithmetic::BF16 || (arithmetic == Arithmetic::FP8X2 && is_extra_fp4)) {
