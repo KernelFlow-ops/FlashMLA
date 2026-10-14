@@ -277,6 +277,14 @@ sparse_decode_fwd(
 #else
     bool enable_split_kv = !enable_batch_invariant && !(topk + extra_topk <= 640);
 #endif
+#if defined(FLASH_MLA_IS_BUILD_ON_CUDA) && defined(FLASH_MLA_ENABLE_SM120)
+    // sm120 runs one CTA per query token and 64 heads, through all the tiles of its request. While those CTAs fill at most
+    // half of the SMs, splitting the requests over the idle ones wins despite the combine kernel (on an RTX 5090, 128 + 512
+    // tokens: 1.1x to 3.9x faster for 1 to 64 CTAs, 3-5% slower for 128)
+    if (arch.is_sm120f() && !enable_batch_invariant && (int64_t)b * s_q * std::max(h_q / 64, 1) * 2 <= arch.num_sms) {
+        enable_split_kv = true;
+    }
+#endif
 
     // metadata sanity check
     TORCH_CHECK(b > 0);
