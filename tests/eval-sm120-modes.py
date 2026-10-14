@@ -61,6 +61,8 @@ FAMILIES: Dict[str, Tuple[quant.KVCacheLayout, Optional[quant.KVCacheLayout]]] =
     "fp8+mxfp4": (L.V41_FP8Sparse, L.V41_MXFP4Sparse),
     "mxfp4": (L.V41_MXFP4Sparse, L.V41_MXFP4Sparse),
     "mxfp4-main": (L.V41_MXFP4Sparse, None),
+    "nvfp4-main": (L.V41_FP4Sparse, None),                   # T-10 (phase 6 G1): V41_FP4Sparse as the main cache. The upstream kernels accept it only as an extra cache
+    "nvfp4": (L.V41_FP4Sparse, L.V41_FP4Sparse),
 }
 
 # data classes: sigma = target standard deviation (over valid tokens, nat) of logit * sm_scale; kamp = every token and 32-dim group of K gets a gain 2^U(-6, 6)
@@ -116,6 +118,10 @@ def apply_k_gain(t: lib.TestcaseForDecode, seed: int, spread: float = 6.0):
         u = torch.rand(*k.shape[:-1], 16, generator=gen, dtype=torch.float32) * (2 * spread) - 2 * spread
         k_new = (k.float().view(*k.shape[:-1], 16, 32) * torch.exp2(u).unsqueeze(-1)).view(k.shape).to(torch.bfloat16)
         layout = scope.kvcache_layout or L.V41_FP8Sparse
+        if layout == L.V41_FP4Sparse and _FP4_2L_CFG is not None:
+            scope.blocked_k_quantized, scope.fp4_g = quant.quantize_k_cache_fp4_2l(k_new, **_FP4_2L_CFG)
+            scope.blocked_k = quant.dequantize_k_cache_fp4_2l(scope.blocked_k_quantized, scope.fp4_g)
+            continue
         scope.blocked_k_quantized = quantize_without_scale_floor(k_new, layout)
         scope.blocked_k = quant.dequantize_k_cache(scope.blocked_k_quantized, layout)
 
@@ -161,7 +167,39 @@ def logit_std(t: lib.TestcaseForDecode) -> float:
     return float(var.sqrt()[rows].mean()) if rows.any() else float("nan")
 
 
-def make_case(cls: str, family: str, h: int, seed: int, b: int, s_q: int, topk: int = 192, extra_topk: int = 576) -> Case:
+_FP4_2L_CFG: Optional[dict] = None      # set by fp4_two_level_writer: the arguments of quant.quantize_k_cache_fp4_2l for the V41_FP4Sparse caches of the data being generated
+
+
+@contextlib.contextmanager
+def fp4_two_level_writer(cfg: Optional[dict]):
+    """While active, the quant_and_dequant_ of lib.KVScope (and the re-quantization of apply_k_gain) write V41_FP4Sparse caches with the two-level writer and keep the integer(s) g in scope.fp4_g"""
+    global _FP4_2L_CFG
+    if cfg is None:
+        yield
+        return
+    orig = lib.KVScope.quant_and_dequant_
+
+    def patched(self):
+        if (self.kvcache_layout or L.V41_FP8Sparse) != L.V41_FP4Sparse:
+            return orig(self)
+        self.blocked_k_quantized, self.fp4_g = quant.quantize_k_cache_fp4_2l(self.blocked_k, **cfg)
+        self.blocked_k = quant.dequantize_k_cache_fp4_2l(self.blocked_k_quantized, self.fp4_g)
+
+    lib.KVScope.quant_and_dequant_ = patched
+    _FP4_2L_CFG = cfg
+    try:
+        yield
+    finally:
+        lib.KVScope.quant_and_dequant_ = orig
+        _FP4_2L_CFG = None
+
+
+def make_case(cls: str, family: str, h: int, seed: int, b: int, s_q: int, topk: int = 192, extra_topk: int = 576, fp4_2l: Optional[dict] = None) -> Case:
+    with fp4_two_level_writer(fp4_2l):
+        return _make_case(cls, family, h, seed, b, s_q, topk, extra_topk)
+
+
+def _make_case(cls: str, family: str, h: int, seed: int, b: int, s_q: int, topk: int, extra_topk: int) -> Case:
     cfg = CLASSES[cls]
     main, extra = FAMILIES[family]
     has_extra = extra is not None
@@ -181,11 +219,15 @@ def make_case(cls: str, family: str, h: int, seed: int, b: int, s_q: int, topk: 
     return Case(cls, family, h, p, t, logit_std(t))
 
 
-def make_corner_cases(seed0: int, b: int, s_q: int) -> List[Case]:
+CORNER_EXTRA = {"nvfp4": dict(have_zero_seqlen_k=True, have_topk_length=True, have_extra_topk_length=True), "nvfp4-main": dict(have_zero_seqlen_k=True, have_topk_length=True)}      # T-10: appended after the four fixed cases
+
+
+def make_corner_cases(seed0: int, b: int, s_q: int, extra_families: Tuple[str, ...] = ()) -> List[Case]:
     """All-invalid indices and zero-length sequences with attn_sink / topk_length: lonely query tokens (out = 0, lse = +inf) and empty blocks"""
     cases = []
     for i, (kw, family) in enumerate([(dict(is_all_indices_invalid=True), "fp8+fp4"), (dict(have_zero_seqlen_k=True, have_topk_length=True, have_extra_topk_length=True), "fp8+fp8"),
-                                      (dict(have_zero_seqlen_k=True, have_topk_length=True), "fp8"), (dict(have_zero_seqlen_k=True, have_topk_length=True, have_extra_topk_length=True), "mxfp4")]):
+                                      (dict(have_zero_seqlen_k=True, have_topk_length=True), "fp8"), (dict(have_zero_seqlen_k=True, have_topk_length=True, have_extra_topk_length=True), "mxfp4")]
+                                     + [(CORNER_EXTRA[f], f) for f in extra_families]):
         main, extra = FAMILIES[family]
         has_extra = extra is not None
         base = dict(b=b, h_q=64, s_q=s_q, h_kv=1, s_kv=512, is_varlen=True, topk=128, enable_attn_sink=True, extra_s_k=512 if has_extra else None, extra_topk=128 if has_extra else None,
@@ -237,8 +279,9 @@ def metrics(out: torch.Tensor, lse: torch.Tensor, out_ref: torch.Tensor, lse_ref
 # Mode combinations
 # ----------------------------------------------------------------------------------------------
 OM = emu.OperandMode
-ALL = ("fp8", "fp8+fp8", "fp8+fp4", "fp8+mxfp4", "mxfp4", "mxfp4-main")
-FP8_LIKE = ("fp8", "fp8+fp8", "fp8+fp4", "fp8+mxfp4", "mxfp4", "mxfp4-main")      # every family has MXFP8-compatible operands (fp4 caches via the k8 conversion)
+ALL = ("fp8", "fp8+fp8", "fp8+fp4", "fp8+mxfp4", "mxfp4", "mxfp4-main", "nvfp4-main", "nvfp4")
+FP8_LIKE = ("fp8", "fp8+fp8", "fp8+fp4", "fp8+mxfp4", "mxfp4", "mxfp4-main", "nvfp4-main", "nvfp4")      # every family has MXFP8-compatible operands (fp4 caches via the k8 conversion)
+NVFP4_KERNEL_FAMILIES = ("fp8+fp4", "nvfp4", "nvfp4-main")           # the caches with V41_FP4Sparse tiles (T-10: the rows kernel-nvfp4-*)
 KERNEL_FAMILIES = ("fp8", "fp8+fp8")                                  # the cache types the P2 kernel supports
 MXFP4_KERNEL_FAMILIES = ("mxfp4", "mxfp4-main")                       # the cache types mxfp4.cu supports
 HAS_FP4 = ("fp8+fp4",)
@@ -371,6 +414,25 @@ def build_combos() -> List[Tuple[str, str, emu.Mode, Tuple[str, ...]]]:
     add("p3-pv-d2", "PV only: V of the fp4 tile as hi + lo e4m3 on the tile scale (d2); P bf16", HAS_FP4, fp4=OM("bf16", "exact", "rebase", "d2"), **kern)
     add("p3-p1-only", "P as one e4m3 term only (B=32, constant SF_A); everything else exact: the error floor of the one-term P in the mxfp8 mode", HAS_FP4, p="e4m3x1", **kern)
     add("p3-p2-only", "P as two e4m3 terms only; everything else exact", HAS_FP4, p="e4m3x2", **kern)
+
+    # ---- T-10 (phase 6 G1): the kernel rows for caches with V41_FP4Sparse tiles (fp8+fp4: the extra cache; nvfp4-main: the main cache; nvfp4: both). The FP4 tiles are the same wherever they sit.
+    #      kernel-nvfp4-mxfp8 = the mxfp8.cu instance <1, true> bit for bit (= p3-mxfp8-nvq2s: Q two NVFP4 terms with the kernel scale rule, K as stored, V one e4m3 term on the scale
+    #      2^ceil(log2(6 * largest 16-dim scale of the tile / 448)), P one e4m3 term, B = 32, fp32 per k64 instruction). The 2^g of a two-level cache is part of the stored scales here
+    #      (gather_scope / decode_native), which is what the kernel does by folding it into the logit scale and the rebase tile exponent
+    #      kernel-nvfp4-fp8x2 = the precise tier (G2a): main FP8 tile = kernel-fp8x2; FP4 tile: Q four NVFP4 terms with a per-head power-of-two second level (pa), P two e4m3 terms,
+    #      V hi + lo (d2, lo scale 2^-4), lo x lo not issued (= p3-fp8x2-nvq4pa-v2). Variants: Q x3 / x5, V scale from 6 x the largest 16-dim scale (d2s), Q without the second level
+    fp4_tile = lambda q, v8="d2": OM(q, "native", "rebase", v8)
+    add("kernel-nvfp4-mxfp8", "the mxfp8 tier on V41_FP4Sparse tiles (= mxfp8.cu <1, true>): Q x2 NVFP4, V one e4m3 term (d1s), P x1, B=32, fp32 per k64 instruction; main FP8 tile = kernel-mxfp8",
+        NVFP4_KERNEL_FAMILIES, fp8=mx["fp8"], fp4=OM("nvfp4x2", "native", "rebase", "d1s"), p="e4m3x1", **kern)
+    add("kernel-nvfp4-fp8x2", "the precise tier on V41_FP4Sparse tiles: Q x4 NVFP4 with a per-head 2^k second level (pa), V hi + lo (d2), P x2, B=32; main FP8 tile = kernel-fp8x2",
+        NVFP4_KERNEL_FAMILIES, fp8=x2["fp8"], fp4=fp4_tile("nvfp4x4pa"), p="e4m3x2", **kern)
+    add("kernel-nvfp4-fp8x2-q3", "kernel-nvfp4-fp8x2 with Q x3 (second level)", NVFP4_KERNEL_FAMILIES, fp8=x2["fp8"], fp4=fp4_tile("nvfp4x3pa"), p="e4m3x2", **kern)
+    add("kernel-nvfp4-fp8x2-q5", "kernel-nvfp4-fp8x2 with Q x5 (second level)", NVFP4_KERNEL_FAMILIES, fp8=x2["fp8"], fp4=fp4_tile("nvfp4x5pa"), p="e4m3x2", **kern)
+    add("kernel-nvfp4-fp8x2-q4one", "kernel-nvfp4-fp8x2 with Q x4 on a single level (no second level): the control that does not pass", NVFP4_KERNEL_FAMILIES, fp8=x2["fp8"], fp4=fp4_tile("nvfp4x4"), p="e4m3x2", **kern)
+    add("kernel-nvfp4-fp8x2-v2s", "kernel-nvfp4-fp8x2 with the V scale from 6 x the largest 16-dim scale (d2s)", NVFP4_KERNEL_FAMILIES, fp8=x2["fp8"], fp4=fp4_tile("nvfp4x4pa", "d2s"), p="e4m3x2", **kern)
+    add("kernel-nvfp4-fp8x2-q3v2s", "kernel-nvfp4-fp8x2 with Q x3 (second level) and d2s", NVFP4_KERNEL_FAMILIES, fp8=x2["fp8"], fp4=fp4_tile("nvfp4x3pa", "d2s"), p="e4m3x2", **kern)
+    add("kernel-nvfp4-fp8x2-q5v2s", "kernel-nvfp4-fp8x2 with Q x5 (second level) and d2s", NVFP4_KERNEL_FAMILIES, fp8=x2["fp8"], fp4=fp4_tile("nvfp4x5pa", "d2s"), p="e4m3x2", **kern)
+    add("kernel-nvfp4-q4p1", "precise-tier variant: Q x4 (second level), V hi + lo, P x1", NVFP4_KERNEL_FAMILIES, fp8=mx["fp8"], fp4=fp4_tile("nvfp4x4pa"), p="e4m3x1", **kern)
 
     # ---- MXFP4 (e2m1 + ue8m0 per 32): Q as e4m3 (mxf8f6f4) or e2m1 (mxf4)
     for q in ("mxfp8x1", "mxfp8x2", "mxfp4x1", "mxfp4x2", "mxfp4x3", "mxfp4x4", "mxfp4x6"):
@@ -539,7 +601,7 @@ def summarize(rows: List[dict], combos, classes: List[str]) -> str:
     return "\n".join(out) + "\n"
 
 
-NUM_CORNER_CASES = 4
+NUM_CORNER_CASES = 4        # the fixed corner cases; the families of CORNER_EXTRA that are asked for add one case each (spec[2])
 
 
 def case_specs(classes: List[str], families: List[str], heads: List[int], repeat: int = 1) -> List[tuple]:
@@ -548,7 +610,7 @@ def case_specs(classes: List[str], families: List[str], heads: List[int], repeat
     for cls in classes:
         for rep in range(repeat):
             if cls == "corner":
-                specs.append(("corner", seed))
+                specs.append(("corner", seed) + ((tuple(f for f in families if f in CORNER_EXTRA),) if any(f in CORNER_EXTRA for f in families) else ()))
                 seed += 10
                 continue
             for family in families:
@@ -558,16 +620,16 @@ def case_specs(classes: List[str], families: List[str], heads: List[int], repeat
     return specs
 
 
-def iter_cases(specs: List[tuple], b: int, s_q: int, quiet: bool = False):
+def iter_cases(specs: List[tuple], b: int, s_q: int, quiet: bool = False, fp4_2l: Optional[dict] = None):
     """Generate the cases one at a time (a case holds the caches of its batch: keeping all of them alive costs more than 20 GB of GPU memory)"""
     for spec in specs:
         with upstream_defaults():
             if spec[0] == "corner":
-                cs = make_corner_cases(spec[1], b, s_q)
+                cs = make_corner_cases(spec[1], b, s_q, spec[2] if len(spec) > 2 else ())
             else:
                 cls, family, h, seed = spec
                 t0 = time.time()
-                c = make_case(cls, family, h, seed, b, s_q)
+                c = make_case(cls, family, h, seed, b, s_q, fp4_2l=fp4_2l)
                 c.seed = seed
                 c.gap_mean, c.gap_max = exp_gap_stats(c.t)
                 if not quiet:
@@ -577,8 +639,8 @@ def iter_cases(specs: List[tuple], b: int, s_q: int, quiet: bool = False):
             yield c
 
 
-def build_cases(classes: List[str], families: List[str], heads: List[int], b: int, s_q: int, repeat: int = 1, quiet: bool = False) -> List[Case]:
-    return list(iter_cases(case_specs(classes, families, heads, repeat), b, s_q, quiet))
+def build_cases(classes: List[str], families: List[str], heads: List[int], b: int, s_q: int, repeat: int = 1, quiet: bool = False, fp4_2l: Optional[dict] = None) -> List[Case]:
+    return list(iter_cases(case_specs(classes, families, heads, repeat), b, s_q, quiet, fp4_2l))
 
 
 def run(cases, combos, log=print, total: Optional[int] = None) -> List[dict]:
@@ -1393,6 +1455,179 @@ def selftest_fp4() -> bool:
     return ok
 
 
+# ----------------------------------------------------------------------------------------------
+# Two-level NVFP4 cache (T-10): the writer against an independent scalar implementation, g = 0 against the upstream V41_FP4Sparse writer, the emulator's second-level path
+# ----------------------------------------------------------------------------------------------
+def slow_fp4_2l(x, rule: str, four_six: bool, granularity: str, g_fixed: Optional[int] = None):
+    """
+    The two-level NVFP4 writer with python scalars and numpy float32 (x: float32 [n, 512], rows are tokens). Returns (dequantized values float64 [n, 512], block scales float64 [n, 32], g list[int]); NaN scale = poisoned block.
+    Torch on CUDA divides a float32 tensor by a python scalar as a multiplication with fp32(1 / scalar) (the upstream writer's `amax / 6.0`), so the scale estimate is a * fp32(1 / qmax)
+    """
+    n = x.shape[0]
+    top = quant.FP4_2L_TOP_46 if four_six else quant.FP4_2L_TOP
+    finite = np.where(np.isfinite(x), np.abs(x), 0.0)
+
+    def choose_g(amax: float) -> int:
+        if not amax > 0:
+            return 0
+        m, e = math.frexp(float(np.float64(amax) / top))
+        return e - 1 if m == 0.5 else e
+
+    gs = [g_fixed if g_fixed is not None else choose_g(float(finite.max()))] * n if granularity == "tensor" else [choose_g(float(finite[i].max())) for i in range(n)]
+    vals = np.zeros((n, 512))
+    scl = np.zeros((n, 32))
+    for i in range(n):
+        G = np.float32(2.0 ** gs[i])
+        for t in range(32):
+            xt = x[i, 16 * t:16 * t + 16]
+            if not np.isfinite(xt).all():
+                scl[i, t] = np.nan
+                vals[i, 16 * t:16 * t + 16] = np.nan
+                continue
+            a = np.float32(np.abs(xt).max()) / G
+
+            def one(qmax: float):
+                if rule == "ceil":
+                    s = next((v for v in _T_E4M3[1:] if qmax * v >= float(a)), _T_E4M3[-1])
+                else:
+                    est = np.float32(a * np.float32(np.float32(1.0) / np.float32(qmax)))
+                    s = emu._table_round(float(min(max(est, np.float32(2.0 ** -9)), np.float32(448.0))), _T_E4M3)
+                codes = [emu._table_round(float(np.float32(v) / np.float32(np.float32(s) * G)), _T_E2M1) for v in xt]
+                return codes, s
+
+            c6, s6 = one(6.0)
+            best = (c6, s6)
+            if four_six:
+                c4, s4 = one(4.0)
+                e6 = sum((float(v) - c * s6 * float(G)) ** 2 for v, c in zip(xt, c6))
+                e4 = sum((float(v) - c * s4 * float(G)) ** 2 for v, c in zip(xt, c4))
+                if e4 < e6:
+                    best = (c4, s4)
+            vals[i, 16 * t:16 * t + 16] = [c * best[1] * float(G) for c in best[0]]
+            scl[i, t] = best[1]
+    return vals, scl, gs
+
+
+def selftest_two_level(verbose: bool = True) -> bool:
+    ok = True
+
+    def report(name, passed, detail=""):
+        nonlocal ok
+        ok &= bool(passed)
+        print(f"[{'PASS' if passed else 'FAIL'}] {name} {detail}", flush=True)
+
+    layout = L.V41_FP4Sparse
+    dev = "cuda"
+    bytes_eq = lambda a, b: torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8))
+    with torch.inference_mode():
+        # (1) g = 0 (rule rn, no Four Over Six) is the upstream V41_FP4Sparse writer bit for bit; so is the dequantization
+        g = torch.Generator(device=dev).manual_seed(4321)
+        x1 = emu._layout_test_input().to(dev)                                                    # large / tiny / spiky tiles, a zero row, NaN rows, a NaN inside one tile
+        spread = torch.exp2(torch.randint(-14, 10, (6, 64, 1, 32), generator=g, device=dev).float()).repeat_interleave(16, dim=-1)
+        x2 = (torch.randn(6, 64, 1, 512, generator=g, device=dev) * spread).to(torch.bfloat16)  # blocks whose amplitude differs by 2^24
+        x2[2, 7, 0, 100] = float("inf")                                                           # an infinity poisons its block
+        for nm, x in (("layout test input", x1), ("block amplitudes 2^U(-14, 10)", x2)):
+            ref = quant.quantize_k_cache(x, layout)
+            mine, g0 = quant.quantize_k_cache_fp4_2l(x, "rn", False, "tensor", g=0)
+            report(f"two-level writer with g = 0 == quant.quantize_k_cache(V41_FP4Sparse) bytes [{nm}]", bytes_eq(ref, mine) and g0 == 0)
+            d_ref = quant.dequantize_k_cache(ref, layout)
+            d_mine = quant.dequantize_k_cache_fp4_2l(mine, 0)
+            report(f"two-level dequantization with g = 0 == quant.dequantize_k_cache [{nm}]", torch.equal(torch.nan_to_num(d_ref.float(), nan=7e7), torch.nan_to_num(d_mine.float(), nan=7e7)))
+        # (2) the writer against the independent scalar implementation: tensor / token g, rule rn / ceil, Four Over Six off / on
+        gen = torch.Generator(device=dev).manual_seed(99)
+        xs = (torch.randn(2, 8, 1, 512, generator=gen, device=dev) * 0.1) * torch.exp2(torch.randint(-9, 8, (2, 8, 1, 32), generator=gen, device=dev).float()).repeat_interleave(16, dim=-1)
+        xs[0, 0] = 0.0                                                                            # a zero token
+        xs[0, 1, 0, :16] = 6.0 * 448.0 * 2.0 ** torch.randint(-3, 3, (16,), generator=gen, device=dev).float() / 6.0      # block with a spiky amplitude pattern
+        xs[0, 2, 0, 16:32] = torch.tensor([1.0, 1.5, 0.75, 0.25, 6.0, 5.0, 4.0, 3.5, 2.5, 1.25, 0.5, 0.125, 7.0, 0.0, -2.0, -6.0], device=dev) * 0.01      # e2m1 grid / tie points
+        xs[1, 3, 0, 40] = float("nan")                                                            # NaN in one block
+        xs = xs.to(torch.bfloat16)
+        xnp = xs.reshape(16, 512).float().cpu().numpy()
+        for gran in ("tensor", "token"):
+            for rule in ("rn", "ceil"):
+                for fs in (False, True):
+                    q, gg = quant.quantize_k_cache_fp4_2l(xs, rule, fs, gran)
+                    dq = quant.dequantize_k_cache_fp4_2l(q, gg).reshape(16, 512).double().cpu().numpy()
+                    sc = q.view(16, -1)[:, 256:].view(torch.float8_e4m3fn).double().cpu().numpy()
+                    sv, ss, sg = slow_fp4_2l(xnp, rule, fs, gran)
+                    gv = [int(gg)] * 16 if gran == "tensor" else [int(v) for v in gg.reshape(-1).cpu()]
+                    nan_blocks = np.isnan(ss)
+                    same_s = np.array_equal(np.isnan(sc), nan_blocks) and np.array_equal(sc[~nan_blocks], ss[~nan_blocks])
+                    nanv = np.repeat(nan_blocks, 16, axis=1)
+                    same_v = np.array_equal(np.isnan(dq), nanv) and np.array_equal(dq[~nanv], sv[~nanv])
+                    report(f"two-level writer [{gran}, {rule}{', 4/6' if fs else ''}] == independent scalar implementation", same_s and same_v and gv == sg,
+                           f"(g {sorted(set(gv))[:4]}; {int((~nan_blocks).sum())} blocks, scales equal={same_s}, values equal={same_v})")
+        # (3) scale invariance: a power of two on the data moves g and nothing else (the property that keeps small-magnitude caches alive); 4/6 too
+        xc = (torch.randn(3, 64, 1, 512, generator=gen, device=dev) * 0.1).to(torch.bfloat16)
+        for rule, fs in (("rn", False), ("ceil", False), ("rn", True)):
+            qa, ga = quant.quantize_k_cache_fp4_2l(xc, rule, fs, "tensor")
+            qb, gb = quant.quantize_k_cache_fp4_2l((xc.float() * 2.0 ** -12).to(torch.bfloat16), rule, fs, "tensor")
+            report(f"x 2^-12 on the data only moves g by -12, same bytes [{rule}{', 4/6' if fs else ''}]", bytes_eq(qa, qb) and gb == ga - 12, f"(g {ga} -> {gb})")
+        q1, _ = quant.quantize_k_cache_fp4_2l((xc.float() * 2.0 ** -12).to(torch.bfloat16), "rn", False, "tensor", g=0)
+        d1 = quant.dequantize_k_cache(q1, layout).float()
+        report("without the second level (g = 0) the same data x 2^-12 is flushed by the scale floor 2^-9 (the failure the second level removes)",
+               float((d1 - xc.float() * 2.0 ** -12).norm() / (xc.float() * 2.0 ** -12).norm()) > 0.9, f"(relative error {float((d1 - xc.float() * 2.0 ** -12).norm() / (xc.float() * 2.0 ** -12).norm()):.2f})")
+        # (4) properties: rule ceil never saturates a code (6 s G >= amax of the block, s < 448); Four Over Six is blockwise never worse than the same g without it
+        qc, gc = quant.quantize_k_cache_fp4_2l(xc, "ceil", False, "tensor")
+        sc_ = qc.view(3, 64, -1)[..., 256:].view(torch.float8_e4m3fn).float()
+        am = xc.float().view(3, 64, 32, 16).abs().amax(-1)
+        report("rule ceil: 6 * s * G >= block amax wherever s < 448", bool(((6.0 * sc_ * 2.0 ** gc >= am) | (sc_ >= 448.0)).all()))
+        for rule in ("rn", "ceil"):
+            g46 = int(quant.fp4_2l_choose_g(xc.float().abs().amax(), True))
+            qa, _ = quant.quantize_k_cache_fp4_2l(xc, rule, False, "tensor", g=g46)
+            qb, _ = quant.quantize_k_cache_fp4_2l(xc, rule, True, "tensor", g=g46)
+            ea = (quant.dequantize_k_cache_fp4_2l(qa, g46).float() - xc.float()).view(3, 64, 32, 16).pow(2).sum(-1)
+            eb = (quant.dequantize_k_cache_fp4_2l(qb, g46).float() - xc.float()).view(3, 64, 32, 16).pow(2).sum(-1)
+            report(f"Four Over Six [{rule}]: blockwise squared error never above the 6-only quantization at the same g", bool((eb <= ea * (1 + 1e-6)).all()), f"(total error {float(eb.sum() / ea.sum()):.3f} of the 6-only error)")
+        # (5) the emulator's second level: a cache with g != 0 and shifted scale bytes is the same cache as the plain one -> every row gives the same output bit for bit
+        names = ["exact", "kernel-nvfp4-mxfp8", "kernel-nvfp4-fp8x2", "kernel-nvfp4-fp8x2-v2s", "p3-mxfp8-nvq2", "fp4-k8x2", "fp4-v8x2-pv"]
+        modes = {nm: mo for nm, _, mo, _ in build_combos() if nm in names}
+        fam_of = {nm: fams for nm, _, _, fams in build_combos()}
+        for family in ("fp8+fp4", "nvfp4", "nvfp4-main"):
+            for variant in ("tensor g = -3", "token g in -1 .. -5"):
+                with upstream_defaults():
+                    c = make_case("hv4", family, 64, 11, 2, 2)
+                    t = c.t
+                    t2 = dataclasses.replace(t)
+                    good = True
+                    for fld in ("kv_scope", "extra_kv_scope"):
+                        sc0 = getattr(t, fld)
+                        if sc0 is None or (sc0.kvcache_layout or L.V41_FP8Sparse) != layout:
+                            continue
+                        nb, bs = sc0.blocked_k_quantized.shape[:2]
+                        raw = sc0.blocked_k_quantized.view(nb, bs, 288).clone()
+                        s = raw[..., 256:].view(torch.float8_e4m3fn).float()
+                        if variant.startswith("tensor"):
+                            gq = -3
+                            mul = torch.full((nb, bs, 1), 8.0, device=s.device)
+                        else:
+                            gq = torch.randint(-5, 0, (nb, bs), generator=gen, device=dev, dtype=torch.int32)
+                            mul = torch.exp2(-gq.float()).unsqueeze(-1)
+                        ns = s * mul
+                        raw[..., 256:] = ns.to(torch.float8_e4m3fn).view(torch.uint8).view(torch.float8_e4m3fn)
+                        back = raw[..., 256:].view(torch.float8_e4m3fn).float()
+                        good &= bool(torch.equal(torch.nan_to_num(back, nan=-1.0), torch.nan_to_num(ns, nan=-1.0)))        # the shift is exact (no scale left the e4m3 grid)
+                        sc2 = dataclasses.replace(sc0)
+                        sc2.blocked_k_quantized = raw.view(nb, bs, 1, 288)
+                        sc2.fp4_g = gq
+                        dq2 = quant.dequantize_k_cache_fp4_2l(sc2.blocked_k_quantized, gq)
+                        good &= bool(torch.equal(torch.nan_to_num(dq2.float(), nan=7e7), torch.nan_to_num(sc0.blocked_k.float(), nan=7e7)))
+                        setattr(t2, fld, sc2)
+                    report(f"[{family}, {variant}] shifted scales + 2^g dequantize to the plain cache", good)
+                    allsame = True
+                    run_names = [nm for nm in modes if family in fam_of[nm]]
+                    for nm in run_names:
+                        mo = modes[nm]
+                        o1, l1 = emu.simulate_decode(c.p, t, mo)
+                        o2, l2 = emu.simulate_decode(c.p, t2, mo)
+                        same = torch.equal(o1, o2) and torch.equal(l1, l2)
+                        allsame &= same
+                        if not same:
+                            print(f"    differs: {nm}")
+                    report(f"[{family}, {variant}] emulator output bit-identical to the plain cache ({', '.join(run_names)})", allsame)
+    print("ALL PASS" if ok else "SOME CHECKS FAILED")
+    return ok
+
+
 def selftest_framework(verbose: bool = True) -> bool:
     """The vectorized emulator == the slow independent implementation, on small cases that exercise lazy max updates, empty blocks, the fp4 conversions, rebase"""
     ok = True
@@ -1623,6 +1858,12 @@ def selftest_framework(verbose: bool = True) -> bool:
          emu.Mode(fp8=x2["fp8"], fp4=OM("nvfp4x4pa", "native", "rebase", "d2"), p="e4m3x2", B=32, q_kernel_rule=True)),
         ("fp8+fp4", "P3 q8 source (2 NVFP4 Q terms from the mxfp8x1 Q, prescale 'pe', V d1, B32)",
          emu.Mode(fp8=mx["fp8"], fp4=dataclasses.replace(OM("nvfp4x2pe", "native", "rebase", "d1"), q_src="mxfp8x1"), p="e4m3x1", B=32, q_kernel_rule=True)),
+        ("nvfp4", "T-10 mxfp8 tier on FP4 main + extra (Q x2, V d1s, P x1, B32, kernel Q rules; f64 accumulation)",
+         emu.Mode(fp4=OM("nvfp4x2", "native", "rebase", "d1s"), p="e4m3x1", B=32, q_kernel_rule=True)),
+        ("nvfp4", "T-10 precise tier on FP4 main + extra (Q x4 second level pa, V d2, P x2, B32)",
+         emu.Mode(fp4=OM("nvfp4x4pa", "native", "rebase", "d2"), p="e4m3x2", B=32, q_kernel_rule=True)),
+        ("nvfp4-main", "T-10 FP4 main cache only (Q x3 pa, V d2s, P x2, B32)",
+         emu.Mode(fp4=OM("nvfp4x3pa", "native", "rebase", "d2s"), p="e4m3x2", B=32, q_kernel_rule=True)),
         ("fp8+fp8", "exact", emu.Mode()),
         ("fp8+fp4", "k8x2 / v8x2 with lolo", emu.Mode(**ops8(q="mxfp8x2", k4="k8x2", v8="x2"), p="e4m3x2", lolo=True)),
         ("fp8+fp8", "P2 kernel parameters (Q x2, P x2, B32, kernel Q rule; f64 accumulation, the slow reference has no f32seg)", emu.Mode(**ops8(q="mxfp8x2"), p="e4m3x2", B=32, q_kernel_rule=True)),
@@ -1659,6 +1900,7 @@ def selftest_framework(verbose: bool = True) -> bool:
                 assert torch.equal(torch.isinf(lf), torch.isinf(sl))
             report(f"vectorized == slow independent implementation [{cls} {family} {label}]", worst_ulp <= 1.01 and worst_lse < 5e-5, f"(max out diff {worst_ulp:.2f} bf16 ulp, max lse diff {worst_lse:.1e})")
     ok &= selftest_fp4()
+    ok &= selftest_two_level()
     print("ALL PASS" if ok else "SOME CHECKS FAILED")
     return ok
 
@@ -1791,6 +2033,10 @@ def main():
     ap.add_argument("--selftest", action="store_true", help="Check the emulator against an independent slow implementation")
     ap.add_argument("--selftest-fp4", action="store_true", help="Only the FP4 PV part of --selftest (nvfp4 / mxfp4 P, V^T, K requantization, FlashInfer reference row)")
     ap.add_argument("--check-exact", action="store_true", help="Run only the exact combination; exit 1 if it fails the upstream tolerances anywhere")
+    ap.add_argument("--fp4-2l", default="off", choices=["off", "tensor", "token"], help="Write the V41_FP4Sparse caches of the generated data with the two-level NVFP4 writer (quant.quantize_k_cache_fp4_2l): one 2^g per cache tensor / per token. "
+                    "off = the upstream writer (g = 0)")
+    ap.add_argument("--fp4-rule", default="rn", choices=["rn", "ceil"], help="With --fp4-2l: the e4m3 rule of the block scale")
+    ap.add_argument("--fp4-46", action="store_true", help="With --fp4-2l: Four Over Six")
     args = ap.parse_args()
 
     combos = build_combos()
@@ -1831,10 +2077,11 @@ def main():
     combos = [x for x in combos if any(fnmatch.fnmatch(x[0], p) for p in pats)]
     classes = [x for x in args.classes.split(",") if x]
     specs = case_specs(classes, args.families.split(","), [int(x) for x in args.heads.split(",")], args.repeat)
-    total = sum(NUM_CORNER_CASES if sp[0] == "corner" else 1 for sp in specs)
+    total = sum((NUM_CORNER_CASES + (len(sp[2]) if len(sp) > 2 else 0)) if sp[0] == "corner" else 1 for sp in specs)
     torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
-    rows = run(iter_cases(specs, args.b, args.s_q), combos, total=total)
+    fp4_2l = None if args.fp4_2l == "off" else dict(granularity=args.fp4_2l, rule=args.fp4_rule, four_six=args.fp4_46)
+    rows = run(iter_cases(specs, args.b, args.s_q, fp4_2l=fp4_2l), combos, total=total)
     print(f"{len(rows)} runs in {time.time() - t0:.0f} s; peak GPU memory allocated {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB, reserved {torch.cuda.max_memory_reserved() / 2**30:.2f} GiB")
     if args.csv:
         with open(args.csv, "w", newline="") as f:
