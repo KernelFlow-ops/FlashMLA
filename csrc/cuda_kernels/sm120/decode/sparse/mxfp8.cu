@@ -45,12 +45,6 @@ I/O: See SparseAttnDecodeParams in csrc/params.h
 */
 #include "common.h"
 
-#include <climits>
-#include <cstdlib>
-#include <cstring>
-#include <cuda.h>
-#include <cudaTypedefs.h>
-
 namespace sm120::decode::sparse {
 namespace mxfp8_path {
 
@@ -169,14 +163,6 @@ struct VStore {
             asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};\n" :: "r"(addr), "r"(vals[0]), "r"(vals[1]), "r"(vals[2]), "r"(vals[3]));
         }
     }
-};
-
-// The tensor maps of the fp8 caches for the gather4: a cache as a 2-D tensor [rows][ROW_BYTES / 4] of 32-bit
-// elements, row = block * rows_per_block + index in the block. rows_per_block = 0: no tensor map (an fp4 cache, or
-// a block stride that is not a whole number of rows); its rows are copied one by one.
-struct GatherMaps {
-    CUtensorMap kv, extra_kv;
-    int kv_rows_per_block, extra_rows_per_block;
 };
 
 // The tiles of a CTA in order: the blocks [start, end) of each of its requests
@@ -1057,45 +1043,15 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
     }
 }
 
-// The tensor map of an fp8 cache for the gather4 (see GatherMaps); returns rows_per_block, 0 without a map.
-// FLASH_MLA_SM120_GATHER4=0 turns the gather4 off (one bulk copy per row), for comparisons.
-static int make_gather_map(CUtensorMap &map, const void *cache, int num_blocks, int page_block_size, int64_t block_stride) {
-    const char *env = std::getenv("FLASH_MLA_SM120_GATHER4");
-    if ((env != nullptr && std::strcmp(env, "0") == 0) || num_blocks <= 0 || block_stride % ROW_BYTES != 0) {
-        return 0;
-    }
-    const int64_t rows_per_block = block_stride / ROW_BYTES;
-    const int64_t num_rows = (int64_t)(num_blocks - 1) * rows_per_block + page_block_size;
-    if (rows_per_block < page_block_size || num_rows > INT_MAX) {
-        return 0;
-    }
-    static const PFN_cuTensorMapEncodeTiled_v12000 encode = [] {
-        void *fn = nullptr;
-        cudaDriverEntryPointQueryResult query;
-        const cudaError_t err = cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &fn, 12000, cudaEnableDefault, &query);
-        return err == cudaSuccess && query == cudaDriverEntryPointSuccess ? reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(fn) : nullptr;
-    }();
-    if (encode == nullptr) {
-        return 0;
-    }
-    const cuuint64_t dims[2] = {ROW_BYTES / 4, (cuuint64_t)num_rows};
-    const cuuint64_t strides[1] = {ROW_BYTES};
-    const cuuint32_t box[2] = {ROW_BYTES / 4, 1};
-    const cuuint32_t element_strides[2] = {1, 1};
-    const CUresult res = encode(&map, CU_TENSOR_MAP_DATA_TYPE_UINT32, 2, const_cast<void*>(cache), dims, strides, box, element_strides,
-        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    return res == CUDA_SUCCESS ? (int)rows_per_block : 0;
-}
-
 template<int NUM_TERMS, bool EXTRA_FP4>
 static void launch(const SparseAttnDecodeParams &params) {
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
 
     GatherMaps maps;
     std::memset(&maps, 0, sizeof(maps));
-    maps.kv_rows_per_block = make_gather_map(maps.kv, params.kv, params.num_blocks, params.page_block_size, params.stride_kv_block);
+    maps.kv_rows_per_block = make_gather_map(maps.kv, params.kv, params.num_blocks, params.page_block_size, params.stride_kv_block, ROW_BYTES, ROW_BYTES);
     if (params.extra_topk > 0 && !EXTRA_FP4) {
-        maps.extra_rows_per_block = make_gather_map(maps.extra_kv, params.extra_kv, params.extra_num_blocks, params.extra_page_block_size, params.stride_extra_kv_block);
+        maps.extra_rows_per_block = make_gather_map(maps.extra_kv, params.extra_kv, params.extra_num_blocks, params.extra_page_block_size, params.stride_extra_kv_block, ROW_BYTES, ROW_BYTES);
     }
 
     auto kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<NUM_TERMS, EXTRA_FP4>;

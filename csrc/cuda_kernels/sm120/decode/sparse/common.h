@@ -5,6 +5,11 @@
 
 #include "kernel.h"
 
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+#include <cuda.h>
+#include <cudaTypedefs.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <math_constants.h>
@@ -90,6 +95,45 @@ __device__ __forceinline__ Request get_request(const SparseAttnDecodeParams &par
         req.n_split_idx = 0;
     }
     return req;
+}
+
+// The tensor maps of the caches for the gather4: a cache as a 2-D tensor [rows][row_bytes / 4] of 32-bit elements,
+// row = block * rows_per_block + index in the block. rows_per_block = 0: no tensor map (a cache whose rows are copied one
+// by one: a block stride that is not a whole number of rows, or a kernel that does not gather this cache with gather4).
+struct GatherMaps {
+    CUtensorMap kv, extra_kv;
+    int kv_rows_per_block, extra_rows_per_block;
+};
+
+// The tensor map of a cache of `row_bytes` per token for the gather4, with a box of `box_bytes` (>= row_bytes; a box
+// wider than the row reads zeros past its end, or before its start from a negative column); returns rows_per_block,
+// 0 without a map. FLASH_MLA_SM120_GATHER4=0 turns the gather4 off (one bulk copy per row), for comparisons.
+inline int make_gather_map(CUtensorMap &map, const void *cache, int num_blocks, int page_block_size, int64_t block_stride, int row_bytes, int box_bytes) {
+    const char *env = std::getenv("FLASH_MLA_SM120_GATHER4");
+    if ((env != nullptr && std::strcmp(env, "0") == 0) || num_blocks <= 0 || block_stride % row_bytes != 0) {
+        return 0;
+    }
+    const int64_t rows_per_block = block_stride / row_bytes;
+    const int64_t num_rows = (int64_t)(num_blocks - 1) * rows_per_block + page_block_size;
+    if (rows_per_block < page_block_size || num_rows > INT_MAX) {
+        return 0;
+    }
+    static const PFN_cuTensorMapEncodeTiled_v12000 encode = [] {
+        void *fn = nullptr;
+        cudaDriverEntryPointQueryResult query;
+        const cudaError_t err = cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &fn, 12000, cudaEnableDefault, &query);
+        return err == cudaSuccess && query == cudaDriverEntryPointSuccess ? reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(fn) : nullptr;
+    }();
+    if (encode == nullptr) {
+        return 0;
+    }
+    const cuuint64_t dims[2] = {(cuuint64_t)row_bytes / 4, (cuuint64_t)num_rows};
+    const cuuint64_t strides[1] = {(cuuint64_t)row_bytes};
+    const cuuint32_t box[2] = {(cuuint32_t)box_bytes / 4, 1};
+    const cuuint32_t element_strides[2] = {1, 1};
+    const CUresult res = encode(&map, CU_TENSOR_MAP_DATA_TYPE_UINT32, 2, const_cast<void*>(cache), dims, strides, box, element_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    return res == CUDA_SUCCESS ? (int)rows_per_block : 0;
 }
 
 __device__ __forceinline__ float f16_to_f32(uint32_t f16) {

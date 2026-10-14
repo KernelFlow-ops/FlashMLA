@@ -22,6 +22,9 @@ like the path of mxfp8.cu, whose structure this file follows (see there for the 
   |Q|, which moves the LSE of a query token that attends a single KV token by up to 3e-6, more than the upstream tolerance (1e-6 absolute
   and 8/65536 relative: it matters where the LSE is below 0.01); the output is well within it. A fifth term (error 1e-5) would pass, but its
   16 registers or 4 KB per warp do not fit next to the 128 registers of O and the 99 KB of shared memory.
+- Gather. Where shared memory allows it (the instances that keep Q in registers, see uses_gather4), the gather warp brings the rows
+  of a tile with 8 TMA gather4 (4 rows each) instead of 32 bulk copies, which it issues in a third of the time; a row in the
+  buffer then takes 288 B (see raw_row_offset).
 
 I/O: See SparseAttnDecodeParams in csrc/params.h
 */
@@ -68,12 +71,30 @@ static constexpr uint32_t PAIR_BARRIER_BASE = 3;
 static_assert(ROW_BYTES % 32 == 16 && V_ROW_BYTES % 32 == 16);
 static_assert(Mxfp4Format::QUANT_BYTES == D_QK / 2 && Mxfp4Format::QUANT_TILE_SIZE == 32 && NUM_SCALE_GROUPS == 16);
 
+// The rows of a tile in a raw buffer. With the gather4, a gather4 writes 4 rows (the group of tokens [4g, +4)) one after another to
+// a 128 B aligned place, each in a box of G4_ROW_STRIDE: the row and 16 B of zeros. Every group then starts at the same bank, and the
+// rows 4 apart of an ldmatrix (8 rows) would meet on the same banks: the odd groups take their boxes from column -4 on (16 B of zeros,
+// then the row), which moves their rows by 16 B, so that the 8 rows fall on the 8 different 16 B positions. Without the gather4 the
+// rows are packed at ROW_BYTES, an odd multiple of 16 B.
+static constexpr int GROUP_ROWS = 4;
+static constexpr int G4_ROW_STRIDE = ROW_BYTES + 16;
+static constexpr int G4_GROUP_STRIDE = GROUP_ROWS * G4_ROW_STRIDE;
+static_assert(G4_GROUP_STRIDE % 128 == 0 && G4_ROW_STRIDE % 128 == 32);
+template<bool G4>
+__host__ __device__ constexpr int raw_row_offset(int r) {
+    return G4 ? (r / GROUP_ROWS) * G4_GROUP_STRIDE + (r / GROUP_ROWS % 2) * 16 + (r % GROUP_ROWS) * G4_ROW_STRIDE : r * ROW_BYTES;
+}
+// The gather4 takes 1.5 KB more of shared memory than the 99 KB leave next to the slots of Q in shared memory
+constexpr bool uses_gather4(int nq) { return num_smem_q_slots(nq) == 0; }
+
+template<int NQ>
 struct SharedMemoryPlan {
-    alignas(128) uint8_t raw[NUM_RAW_BUFS][B_TOPK * ROW_BYTES];     // Rows as stored
+    static constexpr bool GATHER4 = uses_gather4(NQ);
+    alignas(128) uint8_t raw[NUM_RAW_BUFS][GATHER4 ? B_TOPK / GROUP_ROWS * G4_GROUP_STRIDE : B_TOPK * ROW_BYTES];  // Rows as stored, at raw_row_offset
     alignas(16) uint8_t v[NUM_V_BUFS][B_TOPK * V_ROW_BYTES];        // Rebased tiles: e4m3 [row][dim], token r in row v_row_of_token(r)
     alignas(16) float4 s_exchange[NUM_CONSUMER_WARPS][4][32];       // Per consumer warp: its half of S of a tile, in fragment layout
     uint32_t q_scale[NUM_CONSUMER_WARPS][MAX_Q_TERMS][32];          // Per consumer warp and Q term: the scale register of every lane
-    alignas(16) uint4 q_smem[NUM_CONSUMER_WARPS][MAX_SMEM_Q_SLOTS][32];  // Per consumer warp and slot of Q: the A fragment of every lane
+    alignas(16) uint4 q_smem[NUM_CONSUMER_WARPS][num_smem_q_slots(NQ) > 0 ? num_smem_q_slots(NQ) : 1][32];  // Per consumer warp and slot of Q: the A fragment of every lane
     uint32_t valid_mask[NUM_MASK_BUFS];                             // Bit i: token i of the tile is valid
     alignas(16) uint8_t v_scale[NUM_V_BUFS][NUM_SCALE_GROUPS];      // ue8m0 of a rebased tile: one per 32 dims
     uint64_t bar_raw[NUM_RAW_BUFS];                                 // The rows of a tile have arrived
@@ -141,28 +162,52 @@ __device__ __forceinline__ int load_tile_index(const SparseAttnDecodeParams &par
 }
 
 // Start the copies of tile `tile_idx` into its raw buffer. One lane per token.
-// An invalid token is not copied (its row in the cache may hold NaN); its buffer row keeps stale bytes.
-__device__ __forceinline__ void gather_tile(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan, int index, bool is_extra_block, uint32_t raw_idx, uint32_t tile_idx) {
+// An invalid token is not read from the cache (its row there may hold NaN): a gather4 gets row -1 for it, outside the tensor, which
+// arrives as zeros, and a group without a valid token is not gathered; a bulk copy skips the token. Its buffer row then holds zeros
+// or stale bytes, whose S is discarded in the softmax.
+template<int NQ>
+__device__ __forceinline__ void gather_tile(
+    const SparseAttnDecodeParams &params, const GatherMaps &maps, SharedMemoryPlan<NQ> &plan, int index, bool is_extra_block, uint32_t raw_idx, uint32_t tile_idx
+) {
+    constexpr bool G4 = SharedMemoryPlan<NQ>::GATHER4;
     const int lane_idx = threadIdx.x % 32;
     const bool is_token_valid = index != -1;
     const uint32_t valid_mask = __ballot_sync(0xffffffffu, is_token_valid);
     uint64_t *bar = &plan.bar_raw[raw_idx];
-    if (is_token_valid) {
-        const uint32_t page_block_size = is_extra_block ? params.extra_page_block_size : params.page_block_size;
-        const int64_t block_stride = is_extra_block ? params.stride_extra_kv_block : params.stride_kv_block;
-        const uint8_t *cache = reinterpret_cast<const uint8_t*>(is_extra_block ? params.extra_kv : params.kv);
-        const uint32_t page_idx = (uint32_t)index / page_block_size;
-        const uint32_t idx_in_page = (uint32_t)index - page_idx * page_block_size;
-        bulk_copy_g2s(
-            plan.raw[raw_idx] + lane_idx * ROW_BYTES,
-            cache + page_idx * block_stride + (int64_t)idx_in_page * ROW_BYTES,
-            ROW_BYTES,
-            bar
-        );
+    const uint32_t page_block_size = is_extra_block ? params.extra_page_block_size : params.page_block_size;
+    const uint32_t page_idx = (uint32_t)index / page_block_size;
+    const uint32_t idx_in_page = (uint32_t)index - page_idx * page_block_size;
+    const int rows_per_block = is_extra_block ? maps.extra_rows_per_block : maps.kv_rows_per_block;
+    uint32_t num_bytes;
+    if (G4 && rows_per_block > 0) {
+        // Lane g < 8 gathers the group of tokens [4g, +4), the odd groups from column -4 on
+        const int row = is_token_valid ? (int)(page_idx * rows_per_block + idx_in_page) : -1;
+        const int group = lane_idx % 8;
+        const int r0 = __shfl_sync(0xffffffffu, row, 4 * group), r1 = __shfl_sync(0xffffffffu, row, 4 * group + 1);
+        const int r2 = __shfl_sync(0xffffffffu, row, 4 * group + 2), r3 = __shfl_sync(0xffffffffu, row, 4 * group + 3);
+        // Bit 4g: group g has a valid token
+        uint32_t valid_groups = valid_mask | (valid_mask >> 1);
+        valid_groups = (valid_groups | (valid_groups >> 2)) & 0x11111111u;
+        if (lane_idx < 8 && ((valid_groups >> (4 * group)) & 1)) {
+            tma_gather4(plan.raw[raw_idx] + group * G4_GROUP_STRIDE, is_extra_block ? &maps.extra_kv : &maps.kv, -4 * (group % 2), r0, r1, r2, r3, bar);
+        }
+        num_bytes = __popc(valid_groups) * G4_GROUP_STRIDE;
+    } else {
+        if (is_token_valid) {
+            const int64_t block_stride = is_extra_block ? params.stride_extra_kv_block : params.stride_kv_block;
+            const uint8_t *cache = reinterpret_cast<const uint8_t*>(is_extra_block ? params.extra_kv : params.kv);
+            bulk_copy_g2s(
+                plan.raw[raw_idx] + raw_row_offset<G4>(lane_idx),
+                cache + page_idx * block_stride + (int64_t)idx_in_page * ROW_BYTES,
+                ROW_BYTES,
+                bar
+            );
+        }
+        num_bytes = __popc(valid_mask) * ROW_BYTES;
     }
     if (lane_idx == 0) {
         plan.valid_mask[tile_idx % NUM_MASK_BUFS] = valid_mask;
-        mbarrier_arrive_expect_tx(bar, __popc(valid_mask) * ROW_BYTES);
+        mbarrier_arrive_expect_tx(bar, num_bytes);
     }
 }
 
@@ -181,10 +226,11 @@ __device__ __forceinline__ uint32_t f16_pow2(int k) {
 // scale among the valid tokens, less V_HEADROOM, becomes the scale of the tile, and the e2m1 values of every token are multiplied
 // by the power of two that its own scale is above it. Lane = token; an invalid token becomes zeros.
 // The product goes through fp16, where it is exact for scales up to 23 binades below the tile's, and to e4m3 with round to nearest.
-__device__ __forceinline__ void rebase_tile_part(SharedMemoryPlan &plan, uint32_t raw_idx, uint32_t v_idx, uint32_t tile_idx, int group_begin, int group_end) {
+template<int NQ>
+__device__ __forceinline__ void rebase_tile_part(SharedMemoryPlan<NQ> &plan, uint32_t raw_idx, uint32_t v_idx, uint32_t tile_idx, int group_begin, int group_end) {
     const int lane_idx = threadIdx.x % 32;
     const bool is_token_valid = (plan.valid_mask[tile_idx % NUM_MASK_BUFS] >> lane_idx) & 1;
-    const uint8_t *row = plan.raw[raw_idx] + lane_idx * ROW_BYTES;
+    const uint8_t *row = plan.raw[raw_idx] + raw_row_offset<SharedMemoryPlan<NQ>::GATHER4>(lane_idx);
     uint8_t *dst = plan.v[v_idx] + v_row_of_token(lane_idx) * V_ROW_BYTES;
     const uint32_t out_mask = is_token_valid ? 0xffffffffu : 0u;
     #pragma unroll 1
@@ -221,7 +267,8 @@ __device__ __forceinline__ void rebase_tile_part(SharedMemoryPlan &plan, uint32_
     }
 }
 
-__device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan) {
+template<int NQ>
+__device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &params, const GatherMaps &maps, SharedMemoryPlan<NQ> &plan) {
     const int partition_idx = cta_partition_idx();
     const int warp_idx = threadIdx.x / 32 - NUM_CONSUMER_WARPS;
     const int lane_idx = threadIdx.x % 32;
@@ -243,8 +290,8 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
     }
 
     if (warp_idx == 0) {
-        // The gather warp. Issuing the 32 copies of a tile takes it about 3000 cycles (they are serialized), and the
-        // indices come from memory nobody has touched, so they are loaded one tile ahead of their use.
+        // The gather warp. Issuing the 32 bulk copies of a tile takes it about 3000 cycles (they are serialized), 8 gather4 a
+        // third of it, and the indices come from memory nobody has touched, so they are loaded one tile ahead of their use.
         TileCursor cursor;
         enter_request(cursor, params, partition_idx, begin_req_idx);
         #pragma unroll 1
@@ -275,7 +322,7 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
                 is_next_extra_block = cursor.block_idx >= cursor.num_orig_blocks;
                 ++cursor.block_idx;
             }
-            gather_tile(params, plan, index, is_extra_block, raw_idx, tile_idx);
+            gather_tile(params, maps, plan, index, is_extra_block, raw_idx, tile_idx);
             if (++raw_idx == NUM_RAW_BUFS) {
                 raw_idx = 0;
                 raw_phase ^= 1;
@@ -392,15 +439,17 @@ __device__ __forceinline__ void quantize_q(const bf16 *q_row, int64_t row_step, 
 // this half of the dims): thread-id k / 2 of the MMA k selects it, byte-id 2 * (k % 2) the two groups of the MMA.
 // The last slots of Q are not in registers: their A fragments and the scales of all terms wait in shared memory.
 template<int NQ>
-__device__ __forceinline__ void qk_tile(const SharedMemoryPlan &plan, int buf_idx, float (&s_acc)[4][4], const uint32_t (&q_frag)[NQ][4][4]) {
+__device__ __forceinline__ void qk_tile(const SharedMemoryPlan<NQ> &plan, int buf_idx, float (&s_acc)[4][4], const uint32_t (&q_frag)[NQ][4][4]) {
+    constexpr bool G4 = SharedMemoryPlan<NQ>::GATHER4;
+    constexpr int EIGHT_ROWS = raw_row_offset<G4>(8);     // From token r to token r + 8
     const int warp_idx = threadIdx.x / 32;
     const int lane_idx = threadIdx.x % 32;
     const int q_half = warp_idx % 2;
     const int g = lane_idx / 4, t = lane_idx % 4;
     const uint8_t *raw = plan.raw[buf_idx];
     // The scales of this thread's token of the first output tile; read again at every use, which is cheaper than four more registers
-    const uint32_t *k_scales = reinterpret_cast<const uint32_t*>(raw + g * ROW_BYTES + SCALE_OFFSET + 8 * q_half + 4 * (t & 1));
-    const uint32_t base = smem_addr(raw) + (lane_idx % 8) * ROW_BYTES + (lane_idx / 8) * 16 + q_half * (D_QK / 4);
+    const uint32_t *k_scales = reinterpret_cast<const uint32_t*>(raw + raw_row_offset<G4>(g) + SCALE_OFFSET + 8 * q_half + 4 * (t & 1));
+    const uint32_t base = smem_addr(raw) + raw_row_offset<G4>(lane_idx % 8) + (lane_idx / 8) * 16 + q_half * (D_QK / 4);
     // The scales of Q wait in shared memory between the tiles: they are registers the softmax and PV have no use for
     uint32_t q_scale[NQ];
     #pragma unroll
@@ -412,8 +461,8 @@ __device__ __forceinline__ void qk_tile(const SharedMemoryPlan &plan, int buf_id
         #pragma unroll
         for (int n = 0; n < 4; ++n) {
             uint32_t k_frag[4];
-            ldmatrix_x4(k_frag, base + n * (8 * ROW_BYTES) + half * 64);
-            const uint32_t k_scale = k_scales[n * (8 * ROW_BYTES / 4)];
+            ldmatrix_x4(k_frag, base + n * EIGHT_ROWS + half * 64);
+            const uint32_t k_scale = k_scales[n * (EIGHT_ROWS / 4)];
             #pragma unroll
             for (int term = 0; term < NQ; ++term) {
                 uint32_t a[4];
@@ -460,9 +509,9 @@ __device__ __forceinline__ void pv_step(float (&o_acc)[4], const uint32_t (&p_fr
 // where the max moved, and O += P V over this warp's 256 output columns. P never leaves the registers: the S fragments of
 // a thread hold the tokens {8n + 2t, +1} (n = 0..3), which are its A fragment of the PV MMA for the order of k given by
 // v_row_of_token, in which the rebase stores the tokens.
-template<int NUM_P_TERMS>
+template<int NQ, int NUM_P_TERMS>
 __device__ __forceinline__ void softmax_and_pv(
-    const SparseAttnDecodeParams &params, SharedMemoryPlan &plan, uint32_t tile_idx,
+    const SparseAttnDecodeParams &params, SharedMemoryPlan<NQ> &plan, uint32_t tile_idx,
     float (&s_acc)[4][4], float (&o_acc)[NUM_OUT_TILES][4], float (&mi)[2], float (&li)[2]
 ) {
     const int warp_idx = threadIdx.x / 32;
@@ -605,7 +654,7 @@ __device__ __forceinline__ void start_request(float (&o_acc)[NUM_OUT_TILES][4], 
 // One tile, for the consumer warps
 template<int NQ, int NUM_P_TERMS, typename QFrag>
 __device__ __forceinline__ void consume_tile(
-    const SparseAttnDecodeParams &params, SharedMemoryPlan &plan, uint32_t tile_idx, const QFrag &q_frag,
+    const SparseAttnDecodeParams &params, SharedMemoryPlan<NQ> &plan, uint32_t tile_idx, const QFrag &q_frag,
     float (&o_acc)[NUM_OUT_TILES][4], float (&mi)[2], float (&li)[2]
 ) {
     // Raw buffer and barrier phase of the tile; one multiply instead of a division, as registers are short here
@@ -624,7 +673,7 @@ __device__ __forceinline__ void consume_tile(
     if (threadIdx.x % 32 == 0) {
         mbarrier_arrive(&plan.bar_qk_done[buf_idx]);
     }
-    softmax_and_pv<NUM_P_TERMS>(params, plan, tile_idx, s_acc, o_acc, mi, li);
+    softmax_and_pv<NQ, NUM_P_TERMS>(params, plan, tile_idx, s_acc, o_acc, mi, li);
 }
 
 // The end of a request, for a consumer warp: turns the softmax state of its heads into the output scale and the LSE,
@@ -704,7 +753,7 @@ __device__ __forceinline__ const bf16 *q_row(const SparseAttnDecodeParams &param
 }
 
 template<int NQ, int NUM_P_TERMS>
-__device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan) {
+__device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &params, SharedMemoryPlan<NQ> &plan) {
     const int partition_idx = cta_partition_idx();
 
     int begin_req_idx, end_req_idx;
@@ -742,9 +791,9 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
 // The name keeps the upstream substring that the benchmark scripts look for
 template<int NQ, int NUM_P_TERMS>
 __global__ void __launch_bounds__(NUM_THREADS, 1)
-flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecodeParams params) {
+flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecodeParams params, __grid_constant__ const GatherMaps maps) {
     extern __shared__ __align__(128) char wksp_buf[];
-    SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
+    SharedMemoryPlan<NQ> &plan = *reinterpret_cast<SharedMemoryPlan<NQ>*>(wksp_buf);
 
     if (threadIdx.x == 0) {
         #pragma unroll
@@ -769,18 +818,29 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
         consumer_main<NQ, NUM_P_TERMS>(params, plan);
     } else {
         setmaxnreg_dec<NUM_P_TERMS == 1 ? 56 : 40>();
-        producer_main(params, plan);
+        producer_main(params, maps, plan);
     }
 }
 
 template<int NQ, int NUM_P_TERMS>
 static void launch(const SparseAttnDecodeParams &params) {
-    constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+    constexpr size_t smem_size = sizeof(SharedMemoryPlan<NQ>);
     static_assert(smem_size <= 99 * 1024);  // The limit of a block on sm120
+
+    // The tensor maps: a box of G4_ROW_STRIDE, the row and 16 B of zeros (or, from column -4, 16 B of zeros and the row)
+    GatherMaps maps;
+    std::memset(&maps, 0, sizeof(maps));
+    if (SharedMemoryPlan<NQ>::GATHER4) {
+        maps.kv_rows_per_block = make_gather_map(maps.kv, params.kv, params.num_blocks, params.page_block_size, params.stride_kv_block, ROW_BYTES, G4_ROW_STRIDE);
+        if (params.extra_topk > 0) {
+            maps.extra_rows_per_block = make_gather_map(maps.extra_kv, params.extra_kv, params.extra_num_blocks, params.extra_page_block_size,
+                params.stride_extra_kv_block, ROW_BYTES, G4_ROW_STRIDE);
+        }
+    }
 
     auto kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<NQ, NUM_P_TERMS>;
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    kernel<<<decode_grid(params), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params);
+    kernel<<<decode_grid(params), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params, maps);
     KU_CHECK_KERNEL_LAUNCH();
 }
 
