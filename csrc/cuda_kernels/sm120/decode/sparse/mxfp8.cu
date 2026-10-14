@@ -20,10 +20,13 @@ this architecture. Both KV caches have to be the V4.1 fp8 cache.
 
 The CTA layout is that of the bf16 path (bf16.cu): one query token and 64 heads per CTA, tiles of
 B_TOPK tokens, 8 consumer warps and 4 producer warps.
-- Raw rows go through a ring of NUM_RAW_BUFS tiles that is filled as far ahead as it is free, which
-  keeps about three tiles of cp.async.bulk in flight.
-- A tile is free again when the consumers have finished its QK and the producers have rebased it into
-  the single V buffer, which they do while the consumers run QK and the softmax of that tile.
+- Producer warp 0 gathers: one cp.async.bulk per row into a ring of NUM_RAW_BUFS tiles, as far ahead
+  as the ring is free. The copies are serialized (about 90 clock cycles each, whatever their size),
+  so issuing a tile keeps a warp busy, and the row indices are loaded one tile before they are used
+  to keep that load off the path.
+- The other three producer warps rebase every tile as soon as it has arrived, into one of two V
+  buffers, so that the rebase of a tile does not wait for the PV of the tile before it.
+- A raw buffer is free again when the consumers have finished its QK and the rebase warps its rebase.
 
 I/O: See SparseAttnDecodeParams in csrc/params.h
 */
@@ -32,8 +35,13 @@ I/O: See SparseAttnDecodeParams in csrc/params.h
 namespace sm120::decode::sparse {
 namespace mxfp8_path {
 
-static constexpr int NUM_RAW_BUFS = 4;
-static constexpr int NUM_MASK_BUFS = 8;     // A mask lives from the gather of its tile to its softmax, which is more than NUM_RAW_BUFS tiles
+// Producer warp 0 gathers, the others rebase
+static constexpr int NUM_REBASE_WARPS = NUM_PRODUCER_WARPS - 1;
+static constexpr int NUM_RAW_BUFS = 3;      // Up to three tiles (50 KB) in flight
+static_assert(NUM_RAW_BUFS == 3, "the consumers divide by 3 with __umulhi");
+static constexpr int NUM_V_BUFS = 2;        // The tile at PV and the next one, so that a rebase does not wait for the PV before it
+static constexpr int NUM_MASK_BUFS = 4;     // A mask lives from the gather of its tile to its softmax: NUM_RAW_BUFS + 1 tiles
+static constexpr int NUM_SCALE_GROUPS = D_V / Fp8Format::QUANT_TILE_SIZE;
 // ldmatrix reads 8 or 16 rows at once: a row stride that is an odd multiple of 16 B spreads them over all banks
 static constexpr int ROW_BYTES = Fp8Format::BYTES_PER_TOKEN;
 static constexpr int P_ROW_BYTES = B_TOPK + 16;
@@ -49,17 +57,18 @@ static_assert(Fp8Format::QUANT_BYTES == D_QK && Fp8Format::QUANT_TILE_SIZE == 32
 
 struct SharedMemoryPlan {
     alignas(128) uint8_t raw[NUM_RAW_BUFS][B_TOPK * ROW_BYTES];     // Rows as stored: 512 B e4m3 + 16 B ue8m0
-    alignas(16) uint8_t v[B_TOPK * ROW_BYTES];                      // The tile at PV, rebased: e4m3 [token][dim]
+    alignas(16) uint8_t v[NUM_V_BUFS][B_TOPK * ROW_BYTES];          // Rebased tiles: e4m3 [token][dim]
     alignas(16) uint8_t p[2][NUM_HEADS * P_ROW_BYTES];              // e4m3 [term][head][token]
     alignas(16) float s_exchange[NUM_HEADS / 16][32][16];           // QK partial sums of warps 4-7, in fragment layout
     alignas(16) float softmax_state[NUM_HEADS / 16][32][4];         // Per softmax thread: {max of head g, of head g+8, its share of the sum of head g, of head g+8}
     float row_scale[NUM_HEADS];                                     // Per head: the factor for the old output (per tile), then the final output scale
     uint32_t rescale_flags;                                         // One byte per softmax warp: does any of its heads rescale in this tile
     uint32_t valid_mask[NUM_MASK_BUFS];                             // Bit i: token i of the tile is valid
-    uint32_t v_scale[D_V / 128];                                    // ue8m0 of the tile in `v`: one byte per 32 dims
+    alignas(16) uint8_t v_scale[NUM_V_BUFS][NUM_SCALE_GROUPS];      // ue8m0 of a rebased tile: one per 32 dims
     uint64_t bar_raw[NUM_RAW_BUFS];                                 // The rows of a tile have arrived
     uint64_t bar_qk_done[NUM_RAW_BUFS];                             // The consumers have finished QK on a tile
-    uint64_t bar_v_ready, bar_v_free;                               // `v` holds the next tile / PV on it is done
+    uint64_t bar_rebased[NUM_RAW_BUFS];                             // The rebase warps have written a tile to its V buffer
+    uint64_t bar_v_free[NUM_V_BUFS];                                // The consumers have finished PV on a tile
 };
 
 // The tiles of a CTA in order: the blocks [start, end) of each of its requests
@@ -78,9 +87,9 @@ __device__ __forceinline__ void enter_request(TileCursor &cursor, const SparseAt
     cursor.extra_topk_length = req.extra_topk_length;
 }
 
-// Start the copies of the tile under `cursor` into raw buffer `tile_idx % NUM_RAW_BUFS`. One lane per token.
-// An invalid token is not copied (its row in the cache may hold NaN); its buffer row keeps stale bytes.
-__device__ __forceinline__ void gather_tile(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan, const TileCursor &cursor, uint32_t tile_idx) {
+// The cache position of each token of the tile under `cursor`, one lane per token; -1 = not a token.
+// A load from global memory that has not been touched before: the gather warp issues it one tile ahead.
+__device__ __forceinline__ int load_tile_index(const SparseAttnDecodeParams &params, const TileCursor &cursor) {
     const int s_q_idx = blockIdx.x;
     const int lane_idx = threadIdx.x % 32;
     const bool is_extra_block = cursor.block_idx >= cursor.num_orig_blocks;
@@ -93,9 +102,16 @@ __device__ __forceinline__ void gather_tile(const SparseAttnDecodeParams &params
             : params.indices + (int64_t)cursor.batch_idx * params.stride_indices_b + (int64_t)s_q_idx * params.stride_indices_s_q;
         index = indices[pos];
     }
+    return index;
+}
+
+// Start the copies of tile `tile_idx` into its raw buffer. One lane per token.
+// An invalid token is not copied (its row in the cache may hold NaN); its buffer row keeps stale bytes.
+__device__ __forceinline__ void gather_tile(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan, int index, bool is_extra_block, uint32_t raw_idx, uint32_t tile_idx) {
+    const int lane_idx = threadIdx.x % 32;
     const bool is_token_valid = index != -1;
     const uint32_t valid_mask = __ballot_sync(0xffffffffu, is_token_valid);
-    uint64_t *bar = &plan.bar_raw[tile_idx % NUM_RAW_BUFS];
+    uint64_t *bar = &plan.bar_raw[raw_idx];
     if (is_token_valid) {
         const uint32_t page_block_size = is_extra_block ? params.extra_page_block_size : params.page_block_size;
         const int64_t block_stride = is_extra_block ? params.stride_extra_kv_block : params.stride_kv_block;
@@ -103,7 +119,7 @@ __device__ __forceinline__ void gather_tile(const SparseAttnDecodeParams &params
         const uint32_t page_idx = (uint32_t)index / page_block_size;
         const uint32_t idx_in_page = (uint32_t)index - page_idx * page_block_size;
         bulk_copy_g2s(
-            plan.raw[tile_idx % NUM_RAW_BUFS] + lane_idx * ROW_BYTES,
+            plan.raw[raw_idx] + lane_idx * ROW_BYTES,
             cache + page_idx * block_stride + (int64_t)idx_in_page * ROW_BYTES,
             ROW_BYTES,
             bar
@@ -120,28 +136,25 @@ __device__ __forceinline__ uint32_t f16_pow2_neg(uint32_t shift) {
     return shift <= 14 ? (15 - shift) << 10 : (shift <= 24 ? 1u << (24 - shift) : 0u);
 }
 
-// Rebase the dims [128*part, +128) of the tile in raw buffer `buf_idx` into `plan.v`: per 32 dims the largest
-// exponent among the valid tokens becomes the scale of the tile, and every token is divided by the power of two
-// that its own scale is below it. Lane = token; an invalid token becomes zeros.
+// Rebase the 32-dim groups [group_begin, group_end) of the tile in raw buffer `raw_idx` into V buffer `v_idx`:
+// per group the largest exponent among the valid tokens becomes the scale of the tile, and every token is divided
+// by the power of two that its own scale is below it. Lane = token; an invalid token becomes zeros.
 // The division goes through fp16, where it is exact for shifts up to 15, and back to e4m3 with round to nearest.
-__device__ __forceinline__ void rebase_tile_part(SharedMemoryPlan &plan, uint32_t buf_idx, uint32_t tile_idx, int part) {
+__device__ __forceinline__ void rebase_tile_part(SharedMemoryPlan &plan, uint32_t raw_idx, uint32_t v_idx, uint32_t tile_idx, int group_begin, int group_end) {
     const int lane_idx = threadIdx.x % 32;
     const bool is_token_valid = (plan.valid_mask[tile_idx % NUM_MASK_BUFS] >> lane_idx) & 1;
-    const uint8_t *row = plan.raw[buf_idx] + lane_idx * ROW_BYTES;
-    uint8_t *dst = plan.v + lane_idx * ROW_BYTES + 128 * part;
-    const uint32_t exponents = is_token_valid ? *reinterpret_cast<const uint32_t*>(row + Fp8Format::QUANT_BYTES + 4 * part) : 0u;
+    const uint8_t *row = plan.raw[raw_idx] + lane_idx * ROW_BYTES;
+    uint8_t *dst = plan.v[v_idx] + lane_idx * ROW_BYTES;
     const uint32_t out_mask = is_token_valid ? 0xffffffffu : 0u;
-    uint32_t max_exponents = 0;
-    #pragma unroll
-    for (int tile = 0; tile < 4; ++tile) {
-        const uint32_t exponent = (exponents >> (8 * tile)) & 0xff;
+    #pragma unroll 1
+    for (int group = group_begin; group < group_end; ++group) {
+        const uint32_t exponent = is_token_valid ? row[Fp8Format::QUANT_BYTES + group] : 0u;
         const uint32_t max_exponent = __reduce_max_sync(0xffffffffu, exponent);
-        max_exponents |= max_exponent << (8 * tile);
         const uint32_t factor_bits = f16_pow2_neg(max_exponent - exponent) * 0x00010001u;
         const __half2 factor = *reinterpret_cast<const __half2*>(&factor_bits);
         #pragma unroll
         for (int i = 0; i < 2; ++i) {
-            const uint4 raw = *reinterpret_cast<const uint4*>(row + 128 * part + 32 * tile + 16 * i);
+            const uint4 raw = *reinterpret_cast<const uint4*>(row + 32 * group + 16 * i);
             const uint32_t words[4] = {raw.x, raw.y, raw.z, raw.w};
             uint32_t vals[4];
             #pragma unroll
@@ -155,11 +168,11 @@ __device__ __forceinline__ void rebase_tile_part(SharedMemoryPlan &plan, uint32_
                 }
                 vals[j] = (halves[0] | (halves[1] << 16)) & out_mask;
             }
-            *reinterpret_cast<uint4*>(dst + 32 * tile + 16 * i) = uint4{vals[0], vals[1], vals[2], vals[3]};
+            *reinterpret_cast<uint4*>(dst + 32 * group + 16 * i) = uint4{vals[0], vals[1], vals[2], vals[3]};
         }
-    }
-    if (lane_idx == 0) {
-        plan.v_scale[part] = max_exponents;
+        if (lane_idx == 0) {
+            plan.v_scale[v_idx][group] = max_exponent;
+        }
     }
 }
 
@@ -180,41 +193,70 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
         const Request req = get_request(params, partition_idx, batch_idx);
         num_tiles += max(req.end_block_idx - req.start_block_idx, 0);
     }
+    if (num_tiles == 0) {
+        return;
+    }
 
-    TileCursor cursor;      // The next tile to gather (warp 0 only)
-    enter_request(cursor, params, partition_idx, begin_req_idx);
-    uint32_t num_gathered = 0;
+    if (warp_idx == 0) {
+        // The gather warp. Issuing the 32 copies of a tile takes it about 3000 cycles (they are serialized), and the
+        // indices come from memory nobody has touched, so they are loaded one tile ahead of their use.
+        TileCursor cursor;
+        enter_request(cursor, params, partition_idx, begin_req_idx);
+        #pragma unroll 1
+        while (cursor.block_idx >= cursor.end_block_idx) {
+            enter_request(cursor, params, partition_idx, cursor.batch_idx + 1);
+        }
+        int next_index = load_tile_index(params, cursor);
+        bool is_next_extra_block = cursor.block_idx >= cursor.num_orig_blocks;
+        ++cursor.block_idx;
 
-    #pragma unroll 1
-    for (uint32_t tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
-        if (warp_idx == 0) {
-            // Gather as far ahead as there are raw buffers
-            #pragma unroll 1
-            while (num_gathered < min(tile_idx + NUM_RAW_BUFS, num_tiles)) {
-                if (num_gathered >= NUM_RAW_BUFS) {
-                    // The last tile of this buffer: the consumers have to be done with its QK and all producer warps with its rebase
-                    const uint32_t last_tile_idx = num_gathered - NUM_RAW_BUFS;
-                    mbarrier_wait(&plan.bar_qk_done[last_tile_idx % NUM_RAW_BUFS], (last_tile_idx / NUM_RAW_BUFS) & 1);
-                    mbarrier_wait(&plan.bar_v_ready, last_tile_idx & 1);
-                }
+        uint32_t raw_idx = 0, raw_phase = 0;
+        #pragma unroll 1
+        for (uint32_t tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+            if (tile_idx >= NUM_RAW_BUFS) {
+                // The last tile of this buffer: the consumers have to be done with its QK and the rebase warps with its rebase.
+                // Its barriers cannot complete again before this tile is gathered, so the phase cannot be missed.
+                mbarrier_wait(&plan.bar_qk_done[raw_idx], raw_phase ^ 1);
+                mbarrier_wait(&plan.bar_rebased[raw_idx], raw_phase ^ 1);
+            }
+            const int index = next_index;
+            const bool is_extra_block = is_next_extra_block;
+            if (tile_idx + 1 < num_tiles) {
                 #pragma unroll 1
                 while (cursor.block_idx >= cursor.end_block_idx) {
                     enter_request(cursor, params, partition_idx, cursor.batch_idx + 1);
                 }
-                gather_tile(params, plan, cursor, num_gathered);
+                next_index = load_tile_index(params, cursor);
+                is_next_extra_block = cursor.block_idx >= cursor.num_orig_blocks;
                 ++cursor.block_idx;
-                ++num_gathered;
+            }
+            gather_tile(params, plan, index, is_extra_block, raw_idx, tile_idx);
+            if (++raw_idx == NUM_RAW_BUFS) {
+                raw_idx = 0;
+                raw_phase ^= 1;
             }
         }
-
-        const uint32_t buf_idx = tile_idx % NUM_RAW_BUFS;
-        mbarrier_wait(&plan.bar_raw[buf_idx], (tile_idx / NUM_RAW_BUFS) & 1);
-        if (tile_idx > 0) {
-            mbarrier_wait(&plan.bar_v_free, (tile_idx - 1) & 1);
-        }
-        rebase_tile_part(plan, buf_idx, tile_idx, warp_idx);
-        if (lane_idx == 0) {
-            mbarrier_arrive(&plan.bar_v_ready);
+    } else {
+        // A rebase warp: a third of the 32-dim groups of every tile
+        const int group_begin = warp_idx == 1 ? 0 : (warp_idx == 2 ? 6 : 11);
+        const int group_end = warp_idx == 1 ? 6 : (warp_idx == 2 ? 11 : NUM_SCALE_GROUPS);
+        uint32_t raw_idx = 0, raw_phase = 0;
+        #pragma unroll 1
+        for (uint32_t tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+            const uint32_t v_idx = tile_idx % NUM_V_BUFS;
+            mbarrier_wait(&plan.bar_raw[raw_idx], raw_phase);
+            if (tile_idx >= NUM_V_BUFS) {
+                // PV of the tile that was in this V buffer; its barrier completes next for this tile's PV
+                mbarrier_wait(&plan.bar_v_free[v_idx], ((tile_idx / NUM_V_BUFS) & 1) ^ 1);
+            }
+            rebase_tile_part(plan, raw_idx, v_idx, tile_idx, group_begin, group_end);
+            if (lane_idx == 0) {
+                mbarrier_arrive(&plan.bar_rebased[raw_idx]);
+            }
+            if (++raw_idx == NUM_RAW_BUFS) {
+                raw_idx = 0;
+                raw_phase ^= 1;
+            }
         }
     }
 }
@@ -358,8 +400,10 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
 
         #pragma unroll 1
         for (; block_idx < end_block_idx; ++block_idx, ++tile_idx) {
-            const uint32_t buf_idx = tile_idx % NUM_RAW_BUFS;
-            mbarrier_wait(&plan.bar_raw[buf_idx], (tile_idx / NUM_RAW_BUFS) & 1);
+            // Raw buffer and barrier phase of the tile; one multiply instead of a division, as registers are short here
+            const uint32_t buf_round = __umulhi(tile_idx, 0xaaaaaaabu) >> 1;
+            const uint32_t buf_idx = tile_idx - NUM_RAW_BUFS * buf_round;
+            mbarrier_wait(&plan.bar_raw[buf_idx], buf_round & 1);
 
             // QK: S[head][token] over this warp's half of the dims. The row of an invalid token holds stale bytes; its S is discarded below
             float s_acc[4][4];
@@ -484,14 +528,18 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
 
             // PV: O[head][dim] over this warp's 64 output columns, two head blocks and one term of P at a time to bound
             // the registers that hold P; V is read once per pass, which the tensor pipe hides (one load per 4 MMAs)
-            mbarrier_wait(&plan.bar_v_ready, tile_idx & 1);
+            const uint32_t v_idx = tile_idx % NUM_V_BUFS;
+            {
+                const uint32_t round = __umulhi(tile_idx, 0xaaaaaaabu) >> 1;
+                mbarrier_wait(&plan.bar_rebased[tile_idx - NUM_RAW_BUFS * round], round & 1);
+            }
             {
                 // The two 32-dim groups of this warp's columns: bytes 0 and 1
-                const uint32_t v_scale = *reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(plan.v_scale) + 2 * warp_idx);
+                const uint32_t v_scale = *reinterpret_cast<const uint16_t*>(plan.v_scale[v_idx] + 2 * warp_idx);
                 // P: lane l addresses row 8*((l/8)&1) + l%8 and tokens [16*(l/16), +16) of a head block
                 const uint32_t p_base = smem_addr(plan.p[0]) + (((lane_idx / 8) & 1) * 8 + lane_idx % 8) * P_ROW_BYTES + (lane_idx / 16) * 16;
                 // V: lane l addresses token l
-                const uint32_t v_base = smem_addr(plan.v) + lane_idx * ROW_BYTES + warp_idx * 64;
+                const uint32_t v_base = smem_addr(plan.v[v_idx]) + lane_idx * ROW_BYTES + warp_idx * 64;
                 #pragma unroll
                 for (int m_pair = 0; m_pair < 2; ++m_pair) {
                     #pragma unroll
@@ -523,7 +571,7 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
                 }
             }
             if (lane_idx == 0) {
-                mbarrier_arrive(&plan.bar_v_free);
+                mbarrier_arrive(&plan.bar_v_free[v_idx]);
             }
         }
 
@@ -543,9 +591,12 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
         for (int i = 0; i < NUM_RAW_BUFS; ++i) {
             mbarrier_init(&plan.bar_raw[i], 1);
             mbarrier_init(&plan.bar_qk_done[i], NUM_CONSUMER_WARPS);
+            mbarrier_init(&plan.bar_rebased[i], NUM_REBASE_WARPS);
         }
-        mbarrier_init(&plan.bar_v_ready, NUM_PRODUCER_WARPS);
-        mbarrier_init(&plan.bar_v_free, NUM_CONSUMER_WARPS);
+        #pragma unroll
+        for (int i = 0; i < NUM_V_BUFS; ++i) {
+            mbarrier_init(&plan.bar_v_free[i], NUM_CONSUMER_WARPS);
+        }
         fence_mbarrier_init();
     }
     __syncthreads();
