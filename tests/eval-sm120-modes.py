@@ -59,6 +59,7 @@ FAMILIES: Dict[str, Tuple[quant.KVCacheLayout, Optional[quant.KVCacheLayout]]] =
     "fp8+fp4": (L.V41_FP8Sparse, L.V41_FP4Sparse),
     "fp8+mxfp4": (L.V41_FP8Sparse, L.V41_MXFP4Sparse),
     "mxfp4": (L.V41_MXFP4Sparse, L.V41_MXFP4Sparse),
+    "mxfp4-main": (L.V41_MXFP4Sparse, None),
 }
 
 # data classes: sigma = target standard deviation (over valid tokens, nat) of logit * sm_scale; kamp = every token and 32-dim group of K gets a gain 2^U(-6, 6)
@@ -235,11 +236,12 @@ def metrics(out: torch.Tensor, lse: torch.Tensor, out_ref: torch.Tensor, lse_ref
 # Mode combinations
 # ----------------------------------------------------------------------------------------------
 OM = emu.OperandMode
-ALL = ("fp8", "fp8+fp8", "fp8+fp4", "fp8+mxfp4", "mxfp4")
-FP8_LIKE = ("fp8", "fp8+fp8", "fp8+fp4", "fp8+mxfp4", "mxfp4")      # every family has MXFP8-compatible operands (fp4 caches via the k8 conversion)
+ALL = ("fp8", "fp8+fp8", "fp8+fp4", "fp8+mxfp4", "mxfp4", "mxfp4-main")
+FP8_LIKE = ("fp8", "fp8+fp8", "fp8+fp4", "fp8+mxfp4", "mxfp4", "mxfp4-main")      # every family has MXFP8-compatible operands (fp4 caches via the k8 conversion)
 KERNEL_FAMILIES = ("fp8", "fp8+fp8")                                  # the cache types the P2 kernel supports
+MXFP4_KERNEL_FAMILIES = ("mxfp4", "mxfp4-main")                       # the cache types mxfp4.cu supports
 HAS_FP4 = ("fp8+fp4",)
-HAS_MXFP4 = ("fp8+mxfp4", "mxfp4")
+HAS_MXFP4 = ("fp8+mxfp4", "mxfp4", "mxfp4-main")
 
 
 def ops8(q: str = "mxfp8x1", v: str = "rebase", k4: str = "k8x1", v8: str = "x1") -> dict:
@@ -376,6 +378,20 @@ def build_combos() -> List[Tuple[str, str, emu.Mode, Tuple[str, ...]]]:
     add("mxfp4-mxfp4x2-full", "main fp8x2 pipeline; mxfp4 cache: q-mxfp4x2 QK, v rebase; p-e4m3x2", HAS_MXFP4, fp8=x2["fp8"], mxfp4=OM("mxfp4x2", "native", "rebase"), p="e4m3x2")
     for n in (3, 4):
         add(f"mxfp4-mxfp4x{n}-full", f"main fp8x2 pipeline; mxfp4 cache: q-mxfp4x{n} QK, v rebase; p-e4m3x2", HAS_MXFP4, fp8=x2["fp8"], mxfp4=OM(f"mxfp4x{n}", "native", "rebase"), p="e4m3x2")
+
+    # ---- the MXFP4 kernel (csrc/cuda_kernels/sm120/decode/sparse/mxfp4.cu), parameter for parameter: QK on mxf4 2X (m16n8k64, fp32 per instruction), Q as N e2m1 terms with a
+    #      ue8m0 scale per head and 32 dims (ceil-to-power-of-two(amax * fp32(1/6)), code clamped to [8, 250], residual chain), P = hi * 2^-2 + lo * 2^-6 as for mxfp8.cu,
+    #      V rebased per 32 tokens with the block exponent = (largest exponent of the valid tokens) - 6. mxfp8 tier: 2 Q terms, 1 P term; mxfp4x4 tier: 4 and 2
+    mxk = lambda n: dict(mxfp4=OM(f"mxfp4x{n}", "native", "rebase", v_off=-6))
+    kern4 = dict(kern, accum="f32pair")       # QK of the two warps of a pair: partial sums over the two halves of the dims
+    add("kernel-mxfp4-mxfp8", "the MXFP4 kernel, mxfp8 tier: Q x2 (mxfp4), P x1, V rebase with 6 exponent steps of headroom, B=32, fp32 per-instruction accumulation (partial sums per warp of a pair)", MXFP4_KERNEL_FAMILIES,
+        **mxk(2), p="e4m3x1", **kern4)
+    add("kernel-mxfp4-fp8x2", "the MXFP4 kernel, mxfp4x4 tier: Q x4 (mxfp4), P x2, V rebase with headroom", MXFP4_KERNEL_FAMILIES, **mxk(4), p="e4m3x2", **kern4)
+    add("kernel-mxfp4-q3p2", "MXFP4 kernel variant: Q x3, P x2", MXFP4_KERNEL_FAMILIES, **mxk(3), p="e4m3x2", **kern4)
+    add("kernel-mxfp4-q4p1", "MXFP4 kernel variant: Q x4, P x1", MXFP4_KERNEL_FAMILIES, **mxk(4), p="e4m3x1", **kern4)
+    add("kernel-mxfp4-q2p2", "MXFP4 kernel variant: Q x2, P x2", MXFP4_KERNEL_FAMILIES, **mxk(2), p="e4m3x2", **kern4)
+    add("kernel-mxfp4-nohead", "kernel-mxfp4-fp8x2 without the V headroom (rebase to the largest exponent, like mxfp8.cu)", MXFP4_KERNEL_FAMILIES,
+        mxfp4=OM("mxfp4x4", "native", "rebase"), p="e4m3x2", **kern4)
     return C
 
 
@@ -740,7 +756,7 @@ def slow_decode_token(t, mode: emu.Mode, bi: int, si: int) -> Tuple[torch.Tensor
                 for jt in range(nv):
                     for g in range(16):
                         es = [vterm[n0 + k][jt][1][g] for k in range(B) if valid_arr[n0 + k]]
-                        emax = max(es) if es else 0
+                        emax = max(max(es) + om_blk.v_off, emu.UE8M0_MIN_EXP) if es else 0
                         vsf[jt][32 * g:32 * g + 32] = 2.0 ** emax
                         for k in range(B):
                             if valid_arr[n0 + k]:
@@ -880,6 +896,54 @@ def selftest_framework(verbose: bool = True) -> bool:
         sc0_plain = emu.quantize_q(qn, "nvfp4x4", 4, False).sf[0].double()
         report("kernel NVFP4 Q rule: group amax <= 6 * scale wherever scale < 448", bool((amax_g[sc0 < 448.0] <= 6.0 * sc0[sc0 < 448.0]).all()),
                f"(the nearest-e4m3 rule violates it for {int((amax_g > 6.0 * sc0_plain)[sc0_plain < 448.0].sum())} of {amax_g.numel()} groups)")
+        # the MXFP4 kernel's Q rule (mxfp4.cu): per term and group of 32 dims the ue8m0 code = ceil-to-power-of-two(fp32(amax) * fp32(1/6)) of the residual, clamped to [8, 250];
+        # codes e2m1_rn(x * 2^-e) from the table of e2m1 values; the residual x - code * 2^e in fp32. Independent scalar implementation (numpy float32, math.frexp, table rounding)
+        t_e2m1m = emu._small_float_table(1, 1, 7)
+        qm = q.clone()
+        qm[0, 0, :32] = 6.0 * torch.sign(qm[0, 0, :32])        # amax exactly 6: x = fp32(6 * fp32(1/6)) is 1 or one ulp away from it
+        qm[0, 1, :32] = 0.0                                    # all-zero group
+        qm[0, 2, :32] = qm[0, 2, :32] * 1e-37                  # below the smallest code: the clamp at 8
+        qm[0, 3, :32] = 3.0 * torch.sign(qm[0, 3, :32])        # amax 3
+        qm[1, 0, :32] = 1e38 * torch.sign(qm[1, 0, :32])       # above the largest code: the clamp at 250, e2m1 saturation
+        qm[1, 1, :32] = 384.0 * torch.sign(qm[1, 1, :32])      # 6 * 2^6
+        qm[1, 2, :31] = 0.0                                    # a lone value in the group
+        qm = qm.to(torch.bfloat16).float()
+        rf6 = np.float32(1.0 / 6.0)
+
+        def slow_mx4(grp: "np.ndarray", n: int) -> "np.ndarray":
+            r = grp.astype(np.float32)
+            dense = np.zeros(32)
+            for _ in range(n):
+                x32 = np.float32(np.abs(r).max()) * rf6
+                if x32 == 0:
+                    code = 0
+                else:
+                    mm, ee = math.frexp(float(x32))
+                    code = (ee - 1 if mm == 0.5 else ee) + 127
+                code = min(max(code, 8), 250)
+                sc = 2.0 ** (code - 127)
+                inv = np.float32(2.0 ** -(code - 127))
+                nr = r.copy()
+                for j_ in range(32):
+                    d = emu._table_round(float(r[j_] * inv), t_e2m1m)
+                    dense[j_] += d * sc
+                    nr[j_] = np.float32(float(r[j_]) - d * sc)
+                r = nr
+            return dense
+
+        for n in (1, 2, 3, 4):
+            rec = emu.quantize_q(qm, f"mxfp4x{n}", 4, True).dense().cpu().numpy()
+            bad = 0
+            for b_ in range(qm.shape[0]):
+                for r_ in range(qm.shape[1]):
+                    for g_ in range(16):
+                        bad += not np.array_equal(rec[b_, r_, 32 * g_:32 * g_ + 32], slow_mx4(qm[b_, r_, 32 * g_:32 * g_ + 32].cpu().numpy(), n))
+            report(f"kernel MXFP4 Q rule [mxfp4x{n}] == independent scalar implementation", bad == 0, f"({bad} of {qm.shape[0] * qm.shape[1] * 16} groups differ)")
+        # each term of the rule is the plain rule's grid with a different (never smaller) scale: the first term never saturates unless the code is clamped
+        am4 = qm.double().view(*qm.shape[:-1], 16, 32).abs().amax(-1)
+        sc4 = emu.quantize_q(qm, "mxfp4x1", 4, True).sf[0].double()
+        sat_ok = (am4 <= 6.0 * sc4 * (1 + 2.0 ** -22)) | (sc4 >= 2.0 ** (250 - 127)) | (am4 == 0)
+        report("kernel MXFP4 Q rule: group amax <= 6 * scale unless the code is clamped at 250 (up to the fp32 reciprocal rounding)", bool(sat_ok.all()), f"({int((~sat_ok).sum())} groups violate it)")
         qd8 = emu.quantize_q(torch.cat([q, qk], 0), "mxfp8x1", 4, True).dense()
         report("mxfp8x1 Q (kernel rule) dequantized to float32 is exact (the source of the -q8 rows)", torch.equal(qd8.float().double(), qd8))
         # the scale itself, exhaustively over every finite non-negative bf16 and a log-uniform float32 sample: the smallest e4m3 value v with 6 * v >= amax (searchsorted on the table), clamped to [2^-9, 448]
@@ -905,6 +969,26 @@ def selftest_framework(verbose: bool = True) -> bool:
                             acc = np.float32(acc + np.float32(float((qd[i_][b_, h_, 64 * st:64 * st + 64] * kd[b_, t_, 64 * st:64 * st + 64]).sum())))
                     want[b_, h_, t_] = acc
         report("qk_logits(f32seg) of the fp4 kinds: one fp32 rounding per k64 instruction == independent loop", np.array_equal(got, want), f"({int((got != want).sum())} of {want.size} differ)")
+        # the same with the warp-pair split (f32pair): two partial sums over steps 0..3 and 4..7, added at the end
+        qm3 = emu.quantize_q(qm[:2, :2], "mxfp4x3", 4, True)
+        kc = emu.e2m1_rn(torch.randn(2, 6, 512, generator=g, device="cuda") * 2)
+        ksf = torch.exp2(torch.randint(-6, 3, (2, 6, 16), generator=g, device="cuda").float())
+        got = emu.qk_logits(qm3, emu.Terms([kc], [ksf], 32, 64), "f32pair").cpu().numpy()
+        qd = [(v.double() * sf_.double().repeat_interleave(32, dim=-1)).cpu().numpy() for v, sf_ in zip(qm3.vals, qm3.sf)]
+        kd = (kc.double() * ksf.double().repeat_interleave(32, dim=-1)).cpu().numpy()
+        want = np.zeros((2, 2, 6), dtype=np.float32)
+        for b_ in range(2):
+            for h_ in range(2):
+                for t_ in range(6):
+                    halves = []
+                    for steps in (range(0, 4), range(4, 8)):
+                        acc = np.float32(0.0)
+                        for st in steps:
+                            for i_ in range(len(qd)):
+                                acc = np.float32(acc + np.float32(float((qd[i_][b_, h_, 64 * st:64 * st + 64] * kd[b_, t_, 64 * st:64 * st + 64]).sum())))
+                        halves.append(acc)
+                    want[b_, h_, t_] = np.float32(halves[0] + halves[1])
+        report("qk_logits(f32pair) of the mxf4 kind: two partial sums over the halves of the dims == independent loop", np.array_equal(got, want), f"({int((got != want).sum())} of {want.size} differ)")
         # the prescale only moves the ue4m3 scale floor: x6 with it must be much more accurate than x6 without it, and 'pa' must never clip (error bounded by the last term)
         e_plain = ((emu.quantize_q(q, "nvfp4x6").dense() - q.double()).norm() / q.double().norm()).item()
         e_pa = ((emu.quantize_q(q, "nvfp4x6pa").dense() - q.double()).norm() / q.double().norm()).item()
@@ -920,6 +1004,12 @@ def selftest_framework(verbose: bool = True) -> bool:
         ("fp8+fp4", "nvfp4x1 full + rz", emu.Mode(fp8=mx["fp8"], fp4=OM("nvfp4x1", "native", "rebase", "x1"), p="e4m3x1", rebase_round="rz")),
         ("mxfp4", "mxfp4x2 QK, rebase", emu.Mode(mxfp4=OM("mxfp4x2", "native", "rebase"), fp8=mx["fp8"], p="e4m3x2")),
         ("fp8+mxfp4", "mxfp8x2 + p bf16 + rebase", emu.Mode(**x2)),
+        ("mxfp4", "MXFP4 kernel, mxfp4x4 tier (Q x4 mxfp4 with the kernel rule, P x2, V headroom -6, B32)",
+         emu.Mode(mxfp4=OM("mxfp4x4", "native", "rebase", v_off=-6), p="e4m3x2", B=32, q_kernel_rule=True)),
+        ("mxfp4-main", "MXFP4 kernel, mxfp8 tier (Q x2 mxfp4, P x1, V headroom -6, B32)",
+         emu.Mode(mxfp4=OM("mxfp4x2", "native", "rebase", v_off=-6), p="e4m3x1", B=32, q_kernel_rule=True)),
+        ("mxfp4", "MXFP4 rebase with a large headroom (-20) and rz, Q x3, P bf16",
+         emu.Mode(mxfp4=OM("mxfp4x3", "native", "rebase", v_off=-20), rebase_round="rz", B=32, q_kernel_rule=True)),
         ("fp8+fp4", "P3 mxfp8 step 1 (3 NVFP4 Q terms with the exponent prescale, V direct d1, B32, kernel Q rules)",
          emu.Mode(fp8=mx["fp8"], fp4=OM("nvfp4x3pe", "native", "rebase", "d1"), p="e4m3x1", B=32, q_kernel_rule=True)),
         ("fp8+fp4", "P3 mxfp8 kernel (2 NVFP4 Q terms, V direct d1s: the scale from 6 x the largest 16-dim scale, B32, kernel Q rules)",

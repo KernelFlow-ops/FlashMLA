@@ -174,6 +174,7 @@ def parse_q_mode(name: str) -> Tuple[str, int]:
 
 
 Q_RECIP_448 = float(torch.tensor(1.0 / 448.0, dtype=torch.float32))       # the fp32 constant the P2 kernel multiplies amax with
+MXFP4_Q_MIN_CODE, MXFP4_Q_MAX_CODE = 8, 250                                # the range of the ue8m0 code of a Q scale in mxfp4.cu (so that the scale and its inverse are normal floats)
 
 
 def quantize_q(q: torch.Tensor, name: str, lo_shift: int = 4, kernel_rule: bool = False) -> Terms:
@@ -189,6 +190,8 @@ def quantize_q(q: torch.Tensor, name: str, lo_shift: int = 4, kernel_rule: bool 
     one fp32 ulp of 448 * 2^k.
     kernel_rule (nvfp4): the rule of the P3 kernel: s = the smallest e4m3 value >= amax / 6 (ue4m3_scale_ceil: no code saturates; the plain rule rounds to nearest, which can
     make amax / s slightly larger than 6), codes from y = fp32(x * fp32(1 / s)) (reciprocal and multiply, not a division: e2m1 ties can land differently), residual fp32 x - code * s
+    kernel_rule (mxfp4): the rule of mxfp4.cu: per term, the ue8m0 code = ceil-to-power-of-two(amax * fp32(1/6)) of the residual left by the terms before it, clamped to [8, 250] (exponent
+    [-119, 123], also for the first term: no 1e-4 floor of the cache writer), codes e2m1_rn(x * 2^-e) (satfinite), residual fp32 x - code * 2^e
     """
     kind, n = parse_q_mode(name)
     lead = q.shape[:-1]
@@ -236,7 +239,12 @@ def quantize_q(q: torch.Tensor, name: str, lo_shift: int = 4, kernel_rule: bool 
         return Terms(vals, sfs, 16, 64)
     r = q.reshape(*lead, 16, 32)       # mxfp4
     for i in range(n):
-        sf = pow2f(ue8m0_exp(r.abs().amax(-1) / E2M1_MAX, floor_val=1e-4 if i == 0 else None))
+        if kernel_rule:
+            x = r.abs().amax(-1) * Q_RECIP_6
+            e = torch.clamp(torch.where(x > 0, ue8m0_exp(x, floor_val=None), torch.full_like(ue8m0_exp(x, None), UE8M0_MIN_EXP)), MXFP4_Q_MIN_CODE - 127, MXFP4_Q_MAX_CODE - 127)
+            sf = pow2f(e)
+        else:
+            sf = pow2f(ue8m0_exp(r.abs().amax(-1) / E2M1_MAX, floor_val=1e-4 if i == 0 else None))
         d = e2m1_rn(r / sf.unsqueeze(-1))
         vals.append(d.reshape(*lead, 512)), sfs.append(sf)
         r = r - d * sf.unsqueeze(-1)
@@ -330,10 +338,11 @@ def eight_bit_terms(sd: ScopeData, form: str, lo_shift: int = 4) -> List[Tuple[t
     return out
 
 
-def rebase_v(codes: torch.Tensor, exps: torch.Tensor, valid: torch.Tensor, B: int, rz: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+def rebase_v(codes: torch.Tensor, exps: torch.Tensor, valid: torch.Tensor, B: int, rz: bool = False, off: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Re-express V = codes * 2^exps (per token and 32 dims) on one scale per (block of B tokens, 32 dims): emax = max exponent over the VALID tokens of the
-    block; codes' = round_e4m3(codes * 2^(exp - emax)) (RN-even, or toward zero for rz); the MMA scale is 2^emax.
+    block, plus `off` (a headroom <= 0: the largest token then uses the e4m3 range above 6 and the others keep `-off` more exponent steps below it; clamped to the smallest ue8m0
+    exponent); codes' = round_e4m3(codes * 2^(exp - emax)) (RN-even, or toward zero for rz); the MMA scale is 2^emax.
     Returns (codes' [bs, T, 512], SF_B [bs, T // 32, 512]) where SF_B is per 32-token k-block and per column (a B = 64 block uses the same scale for both k-blocks)
     """
     bs, T, _ = codes.shape
@@ -343,6 +352,8 @@ def rebase_v(codes: torch.Tensor, exps: torch.Tensor, valid: torch.Tensor, B: in
     vmask = valid.view(bs, nb, B, 1)
     emax = torch.where(vmask, e, torch.full_like(e, NEG)).amax(2)               # [bs, nb, 16]
     emax = torch.where(emax == NEG, torch.zeros_like(emax), emax)               # block without a valid token: irrelevant, V = 0
+    if off != 0:
+        emax = torch.clamp(emax + off, min=UE8M0_MIN_EXP)
     shift = torch.where(vmask, e - emax.unsqueeze(2), torch.zeros_like(e))      # <= 0
     scaled = codes.view(bs, nb, B, 16, 32) * pow2f(shift).unsqueeze(-1)         # exact: a power of two
     cp = e4m3_rz(scaled) if rz else e4m3_rn(scaled)
@@ -394,6 +405,7 @@ class OperandMode:
     v8: str = "x1"          # the 8-bit form V is built from when the cache is not MXFP8 already (V41_FP4Sparse): x1 | x2 (per token e4m3 x ue8m0 first, then the rebase: two roundings),
                             # d1 | d2 (direct: e2m1 x s16 -> e4m3 on the block scale in one rounding, see direct_v_terms), d1s | d2s (the same with amax = 6 x the largest scale)
     q_src: str = "bf16"     # what Q is quantized from: bf16 (the original Q) | mxfp8x1 (the e4m3 Q the main tile already uses, quantized with the kernel rule and dequantized exactly; only q = nvfp4 / mxfp4 modes)
+    v_off: int = 0          # headroom of the V rebase scale: the block exponent is the largest exponent of the valid tokens + v_off (mxfp4.cu: -6; the mxfp8 kernel: 0)
 
 
 EXACT_OPS = OperandMode()
@@ -412,7 +424,8 @@ class Mode:
     m: str = "lazy"                     # row max used for P: lazy (upstream: update only when a block exceeds it by > 6) | final (row max over all tokens)
     B: int = 64                         # tokens per block: lazy-max update granularity and V rebase granularity (32 or 64)
     sum: str = "exact"                  # softmax denominator: exact (sum of fp32 P) | quant (sum of the quantized P that the MMA uses)
-    accum: str = "f64"                  # f64: exact sum rounded to fp32 once per logit / per block; f32seg: every 32-k MMA step rounded to fp32 and accumulated in fp32
+    accum: str = "f64"                  # f64: exact sum rounded to fp32 once per logit / per block; f32seg: every MMA step rounded to fp32 and accumulated in fp32;
+                                        # f32pair: as f32seg, but QK as two partial sums over the first / second half of the dims, added at the end (the warp pairs of the kernels)
     rebase_round: str = "rn"            # rn | rz: rounding when the rebase shifts a code into the subnormal range
     q_kernel_rule: bool = False         # Q scale rules of the kernels (mxfp8: fp32 reciprocal of 448, exponent clamped to [2 * q_lo_shift - 127, 123], no 1e-4 floor; nvfp4: smallest e4m3 >= amax / 6); see quantize_q
     lolo: bool = False                  # also issue the lo x lo MMA when both operands have a lo term (default: skipped, 3 instead of 4 MMAs for x2 x x2)
@@ -465,7 +478,7 @@ def v_terms(sd: ScopeData, om: OperandMode, mode: Mode) -> Tuple[List[torch.Tens
     terms = eight_bit_terms(sd, om.v8, mode.k_lo_shift)
     vals, sfbs = [], []
     for codes, exps in terms:
-        c, s = rebase_v(codes, exps, sd.valid, mode.B, rz=(mode.rebase_round == "rz"))
+        c, s = rebase_v(codes, exps, sd.valid, mode.B, rz=(mode.rebase_round == "rz"), off=om.v_off)
         vals.append(c), sfbs.append(s)
     return vals, sfbs
 
@@ -500,13 +513,19 @@ def qk_logits(qt: Terms, kt: Terms, accum: str, budget: int = 1 << 30, lolo: boo
         if accum == "f64":
             out[sl] = sum(p.sum(1) for p in parts).float()
         else:
-            acc = torch.zeros(parts[0].shape[0], h, T, dtype=torch.float32, device=out.device)
             ks = qt.k_step
             gps = ks // g       # scale groups per MMA instruction (k step 32 for the 8-bit kinds, 64 for the fp4 kinds)
-            for s in range(512 // ks):
-                for p in parts:
-                    acc = acc + p[:, s * gps:(s + 1) * gps].sum(1).float()
-            out[sl] = acc
+            nst = 512 // ks
+            # f32pair: the two warps of a pair of the sm120 kernels each accumulate half of the steps (from zero) and the two sums are added afterwards
+            ranges = [range(nst // 2), range(nst // 2, nst)] if accum == "f32pair" else [range(nst)]
+            accs = []
+            for steps in ranges:
+                acc = torch.zeros(parts[0].shape[0], h, T, dtype=torch.float32, device=out.device)
+                for s in steps:
+                    for p in parts:
+                        acc = acc + p[:, s * gps:(s + 1) * gps].sum(1).float()
+                accs.append(acc)
+            out[sl] = accs[0] if len(accs) == 1 else accs[0] + accs[1]
     return out
 
 

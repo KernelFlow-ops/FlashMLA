@@ -27,6 +27,8 @@ Per shape (a row of the output)
 Shapes
   --production  the 16 shapes of tests/test-sparse-decode.py: h in {64, 128} x b in {64, 128, 256, 512} x extra cache FP8/FP4,
                 s_q 4, topk 128 + extra 512, page 256 / 64, varlen KV lengths (the upstream data)
+  --mxfp4       the production shapes on an MXFP4 cache (main and extra): h in {64, 128} x b in {64, 128, 256, 512}, `h{h}_b{b}_mxfp4`; run it
+                with FLASH_MLA_SM120_DECODE_MODE=mxfp8 or mxfp4x4 (bf16 / fp8x2 raise an error on an MXFP4 cache)
   --secondary   small batch: b in {1, 4, 16} x s_q in {1, 4} x h in {64, 128}, 128 + 512, extra FP8/FP4 (`small`; all KV lengths full);
                 topk 2048 without extra cache, b in {1, 4, 16, 64}, s_q 1 (`topk2048`; split-KV + combine kernel);
                 b 1, s_q 4096, 128 + 512 (`longq`; the upstream "prefill as decode" shapes)
@@ -63,6 +65,7 @@ import quant
 from lib import RawTestParamForDecode as RawTestParam
 
 FP8, FP4 = quant.KVCacheLayout.V41_FP8Sparse, quant.KVCacheLayout.V41_FP4Sparse
+MXFP4 = quant.KVCacheLayout.V41_MXFP4Sparse
 SPLITKV_KERNEL = "flash_fwd_splitkv_mla_fp8_sparse_kernel"
 COMBINE_KERNEL = "flash_fwd_mla_combine_kernel"
 FLUSH_BYTES = 8_000_000_000       # kk.bench allocates this much for the L2 flush before every call
@@ -75,7 +78,7 @@ FLUSH_BYTES = 8_000_000_000       # kk.bench allocates this much for the L2 flus
 @dataclasses.dataclass
 class Case:
     name: str
-    group: str      # "production" | "secondary"
+    group: str      # "production" | "secondary" | "mxfp4"
     kind: str       # "production" | "small" | "topk2048" | "longq"
     raw: RawTestParam
     index: int = 0  # position in the full list (before --only); fixes the seeds
@@ -90,6 +93,17 @@ def production_cases() -> List[Case]:
                 raw = RawTestParam(b, h, 4, 1, 256, True, topk=128, d_qk=512, extra_s_k=2048, extra_topk=512,
                                    block_size=256, extra_block_size=64, kvcache_layout=FP8, extra_kvcache_layout=extra_layout)
                 cases.append(Case(f"h{h}_b{b}_{'fp4' if extra_layout else 'fp8'}", "production", "production", raw))
+    return cases
+
+
+def mxfp4_cases() -> List[Case]:
+    """The production shapes on an MXFP4 cache for the main and the extra cache (tests/test-sparse-decode-sm120-mxfp4.py has the same shapes)."""
+    cases = []
+    for h in (64, 128):
+        for b in (64, 128, 256, 512):
+            raw = RawTestParam(b, h, 4, 1, 256, True, topk=128, d_qk=512, extra_s_k=2048, extra_topk=512,
+                               block_size=256, extra_block_size=64, kvcache_layout=MXFP4, extra_kvcache_layout=MXFP4)
+            cases.append(Case(f"h{h}_b{b}_mxfp4", "mxfp4", "production", raw))
     return cases
 
 
@@ -129,7 +143,7 @@ def longq_cases() -> List[Case]:
 
 
 def all_cases() -> List[Case]:
-    cases = production_cases() + small_cases() + topk2048_cases() + longq_cases()
+    cases = production_cases() + small_cases() + topk2048_cases() + longq_cases() + mxfp4_cases()
     for i, c in enumerate(cases):
         c.index = i
     return cases
@@ -602,6 +616,7 @@ def write_markdown(path: str, rows: List[Dict], args, cmd: str):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--production", action="store_true", help="the 16 production shapes")
+    parser.add_argument("--mxfp4", action="store_true", help="the 8 production shapes on an MXFP4 cache (set FLASH_MLA_SM120_DECODE_MODE=mxfp8 or mxfp4x4)")
     parser.add_argument("--secondary", action="store_true", help="small batch / topk 2048 / s_q 4096 shapes (see the module doc)")
     parser.add_argument("--only", type=str, default=None, help="comma separated substrings; keep the cases whose name contains one of them")
     parser.add_argument("--list", action="store_true", help="print the selected cases and exit")
@@ -631,11 +646,13 @@ def main():
         cases += [c for c in full if c.group == "production"]
     if args.secondary:
         cases += [c for c in full if c.group == "secondary"]
+    if args.mxfp4:
+        cases += [c for c in full if c.group == "mxfp4"]
     if args.only:
         keys = args.only.split(",")
         cases = [c for c in cases if any(k in c.name for k in keys)]
     if not cases:
-        parser.error("no cases: pass --production and/or --secondary (and check --only)")
+        parser.error("no cases: pass --production, --secondary and/or --mxfp4 (and check --only)")
     if args.list:
         for c in cases:
             print(c.name, c.kind)
