@@ -393,6 +393,71 @@ def build_combos() -> List[Tuple[str, str, emu.Mode, Tuple[str, ...]]]:
     add("kernel-mxfp4-q2p2", "MXFP4 kernel variant: Q x2, P x2", MXFP4_KERNEL_FAMILIES, **mxk(2), p="e4m3x2", **kern4)
     add("kernel-mxfp4-nohead", "kernel-mxfp4-fp8x2 without the V headroom (rebase to the largest exponent, like mxfp8.cu)", MXFP4_KERNEL_FAMILIES,
         mxfp4=OM("mxfp4x4", "native", "rebase"), p="e4m3x2", **kern4)
+
+    # ---- FP4 PV ("nvfp4" mode, T-08): QK and PV on kind::mxf4nvf4 / mxf4. Every row uses the 64-token pair (B = 64), fp32 accumulation per instruction, P kperm groups unless named otherwise.
+    #      The reference row reproduces the algorithm of FlashInfer's DSv4 NVFP4 kernel (sparse_mla_sm120/kernels/dsv4_nvfp4/grouped_attention.cuh) on the V4.1 cache formats: Q one NVFP4 term (rule rn),
+    #      K native NVFP4 (FP8 / MXFP4 caches re-quantized per token and 16 dims, nvf4r, rule rn), online max updated for every 64 candidates (eager: P <= 1), P rounded to bf16 and quantized per
+    #      (head, 16 consecutive candidates) with the rn rule and no first level, V^T quantized per (dimension, 16 consecutive tokens) with the rn rule and no first level, fp32 accumulation per
+    #      64 candidates, row sum from the unquantized P. (Differences to FlashInfer: all 512 dims are NVFP4 here, FlashInfer keeps 64 rope dims in bf16.)
+    def nv_modes(qn, prule, vrule, p_l1="sa3", v_l1="grp", p46=False, v46=False, m="eager", qk_rule=None, p_group="kperm", p_pre="f32", **extra):
+        qk_rule = qk_rule or prule
+        v = dict(v_l1=v_l1, v_rule=vrule, v46=v46, v_smooth=extra.pop("v_smooth", 0))
+        ks = extra.pop("k_smooth", 0)
+        other = OM(f"nvfp4x{qn}", "nvf4r", "nvf4t", k_rule=qk_rule, k_smooth=ks, **v)
+        native = OM(f"nvfp4x{qn}", "nvf4r" if ks else "native", "nvf4t", k_rule=qk_rule, k_smooth=ks, **v)
+        return dict(fp8=other, mxfp4=other, fp4=native, p="nvfp4", p_l1=p_l1, p_rule=prule, p46=p46, p_group=p_group, p_pre=p_pre, m=m, B=64, accum="f32seg", q_rule=qk_rule, **extra)
+
+    add("fi-dsv4-nvfp4", "FlashInfer DSv4 NVFP4 algorithm on the V4.1 caches: Q nvfp4x1 (rn), K native / nvf4r (rn), eager max, P bf16 -> NVFP4 per 16 contiguous candidates (rn, no first level), "
+        "V^T NVFP4 per 16 tokens (rn, no first level), fp32 per 64 candidates", ALL,
+        **nv_modes(1, "rn", "rn", p_l1="none", v_l1="none", p_group="contig", p_pre="bf16"))
+    cname = lambda r: {"ceil": "c", "rn": "r"}[r]
+    for qn in (1, 2):
+        for pl1 in ("sa3", "none"):
+            for pr in ("ceil", "rn"):
+                for vl1 in ("grp", "none"):
+                    for vr in ("ceil", "rn"):
+                        add(f"nvfp4-q{qn}-p{'s' if pl1 == 'sa3' else 'n'}{cname(pr)}-v{'g' if vl1 == 'grp' else 'n'}{cname(vr)}",
+                            f"Q nvfp4x{qn}; P two-level NVFP4 (first level {pl1}, {pr} scale rule); V^T NVFP4 (first level {vl1}, {vr}); Q / K scale rule = the P rule; eager max, kperm groups",
+                            ALL, **nv_modes(qn, pr, vr, p_l1=pl1, v_l1=vl1))
+    for qn in (1, 2):
+        for r in ("ceil", "rn"):
+            for tag, kw in (("p46", dict(p46=True)), ("v46", dict(v46=True)), ("pv46", dict(p46=True, v46=True))):
+                add(f"nvfp4-q{qn}-ps{cname(r)}-vg{cname(r)}-{tag}", f"as nvfp4-q{qn}-ps{cname(r)}-vg{cname(r)} with Four Over Six on {'P' if tag == 'p46' else 'V^T' if tag == 'v46' else 'P and V^T'} (the first level targets 1536 instead of 2688)",
+                    ALL, **nv_modes(qn, r, r, **kw))
+            add(f"nvfp4-q{qn}-ps{cname(r)}-vg{cname(r)}-lazy", f"as nvfp4-q{qn}-ps{cname(r)}-vg{cname(r)} with the lazy max (threshold 6; Pmax = 64, G = 42)", ALL, **nv_modes(qn, r, r, m="lazy"))
+    # attribution: one operand in FP4, the rest exact
+    for r in ("ceil", "rn"):
+        for l1 in ("sa3", "none"):
+            add(f"nvfp4-attr-P{'' if l1 == 'sa3' else '0'}-{cname(r)}", f"only P -> two-level NVFP4 (first level {l1}, {r}), eager max; QK and V exact", ALL, p="nvfp4", p_l1=l1, p_rule=r, m="eager", B=64)
+        for l1 in ("grp", "none"):
+            vo = OM("bf16", "exact", "nvf4t", v_l1=l1, v_rule=r)
+            add(f"nvfp4-attr-V{'' if l1 == 'grp' else '0'}-{cname(r)}", f"only V^T -> NVFP4 (first level {l1}, {r}); P in float32 (no quantization), eager max, QK exact", ALL, fp8=vo, fp4=vo, mxfp4=vo, p="nvfp4", p_rule="exact", m="eager", B=64)
+        for qn in (1, 2):
+            qo = dict(fp8=OM(f"nvfp4x{qn}", "nvf4r", "exact", k_rule=r), mxfp4=OM(f"nvfp4x{qn}", "nvf4r", "exact", k_rule=r), fp4=OM(f"nvfp4x{qn}", "native", "exact"))
+            add(f"nvfp4-attr-QK{qn}-{cname(r)}", f"only QK -> Q nvfp4x{qn} ({r}) x K native NVFP4 (FP8 / MXFP4 caches: nvf4r, {r}); P bf16, V exact", ALL, accum="f32seg", q_rule=r, **qo)
+    # FP8 tile (and MXFP4 cache) QK left on its native block-scaled kind while PV is FP4: does the K of the FP8 tile need to go to FP4?
+    for qn in (1, 2):
+        for r in ("ceil", "rn"):
+            kw = nv_modes(2, r, r)
+            kw["fp8"] = OM(f"mxfp8x{qn}", "native", "nvf4t", v_l1="grp", v_rule=r)
+            add(f"nvfp4-f8m{qn}-{cname(r)}", f"as nvfp4-q2-ps{cname(r)}-vg{cname(r)} but the FP8 tiles keep their native QK: Q mxfp8x{qn} x K as stored (mxf8f6f4); PV FP4", ("fp8+fp4", "fp8+fp8"), **kw)
+    for qn in (2, 4):
+        for r in ("ceil", "rn"):
+            kw = nv_modes(2, r, r)
+            kw["mxfp4"] = OM(f"mxfp4x{qn}", "native", "nvf4t", v_l1="grp", v_rule=r)
+            add(f"nvfp4-m4q{qn}-{cname(r)}", f"as nvfp4-q2-ps{cname(r)}-vg{cname(r)} but the MXFP4 cache keeps its native QK: Q mxfp4x{qn} (kernel rule) x K as stored (mxf4); PV NVFP4", HAS_MXFP4, q_kernel_rule=True, **kw)
+    for qn in (2, 4):
+        add(f"nvfp4-mx4-q{qn}", f"MXFP4 cache all on kind::mxf4: Q mxfp4x{qn} native QK, P e2m1 + ue8m0 per 32 tokens, V^T mxf4r (ue8m0 per 32 tokens, e2m1 re-rounded); eager max",
+            MXFP4_KERNEL_FAMILIES, mxfp4=OM(f"mxfp4x{qn}", "native", "mxf4r"), p="mxfp4", m="eager", B=64, accum="f32seg", q_kernel_rule=True)
+    # smoothing ablations on top of nvfp4-q2-ps?-vg? (tile 32 tokens for K and V, 64 heads for Q); k0 = K re-quantized from the FP4 cache too, without smoothing
+    for r in ("ceil", "rn"):
+        for tag, kw in (("q", dict(q_smooth=True)), ("k", dict(k_smooth=32)), ("k0", dict(k_smooth=0)), ("v", dict(v_smooth=32)), ("qkv", dict(q_smooth=True, k_smooth=32, v_smooth=32))):
+            if tag == "k0":
+                mm = nv_modes(2, r, r)
+                mm["fp4"] = dataclasses.replace(mm["fp4"], k="nvf4r")
+                add(f"nvfp4-sm-k0-{cname(r)}", f"nvfp4-q2-ps{cname(r)}-vg{cname(r)} with the FP4 cache K also re-quantized (nvf4r), no smoothing: the baseline of the K smoothing row", ALL, **mm)
+                continue
+            add(f"nvfp4-sm-{tag}-{cname(r)}", f"nvfp4-q2-ps{cname(r)}-vg{cname(r)} with smoothing: {tag} (Q minus the mean over 64 heads / K and V minus the mean of the 32-token tile; the means go back exactly)", ALL, **nv_modes(2, r, r, **kw))
     return C
 
 
@@ -838,6 +903,8 @@ def slow_p_block(P64, mode: emu.Mode):
     One block of 64 tokens of P (numpy float32 [64], the unquantized numerators of one row) -> (dequantized values in the G-scaled domain, numpy float64 [64], G). nvfp4: bf16 rounding (p_pre),
     G = p_gain, scale groups of 16 tokens (kperm: slow_kperm_blocks(), contig: consecutive), ue4m3 scale rule; mxfp4: the 32-token tiles, ue8m0 scale 2^ceil(log2(fp32(amax) * fp32(1 / 6)))
     """
+    if mode.p == "nvfp4" and mode.p_rule == "exact":
+        return P64.astype(np.float64), 1.0
     x = P64.astype(np.float32)
     if mode.p_pre == "bf16":
         x = torch.from_numpy(x).to(torch.bfloat16).float().numpy()
@@ -929,6 +996,9 @@ def slow_decode_token_fp4(t, mode: emu.Mode, bi: int, si: int, parts: Optional[d
             if not valid:
                 continue
             kind, _ = emu.parse_q_mode(om.q)
+            if kind == "bf16":
+                kterm[n] = [torch.from_numpy(kdeq.astype(np.float64))]
+                continue
             if kind == "mxfp8":
                 kterm[n] = [c.double() * torch.tensor([2.0 ** e for e in ex], dtype=torch.float64).repeat_interleave(32)
                             for c, ex in _slow_token_terms8(layout, row, "x1" if om.k == "native" else om.k[2:], mode.k_lo_shift)]
@@ -986,10 +1056,14 @@ def slow_decode_token_fp4(t, mode: emu.Mode, bi: int, si: int, parts: Optional[d
                             vdeq[n, d] = emu._table_round(tok_vals[n][d] * 2.0 ** (tok_exps[n][g] - emax), _T_E2M1) * 2.0 ** emax
     else:
         om0 = oms[0]
-        assert all(o.v == "nvf4t" for o in oms)
+        assert all(o.v == oms[0].v for o in oms) and om0.v in ("nvf4t", "exact")
         top = emu.V1_TOP_46 if om0.v46 else emu.V1_TOP
         xv = np.zeros((N, 512), dtype=np.float32)
-        for si_, (lo, hi) in enumerate(scope_ranges):
+        if om0.v == "exact":
+            for n in range(N):
+                if toks[n][1]:
+                    vdeq[n] = toks[n][3]
+        for si_, (lo, hi) in enumerate(scope_ranges if om0.v == "nvf4t" else []):
             kbar = tile_means(lo, hi, om0.v_smooth) if om0.v_smooth else None
             for n in range(lo, hi):
                 if toks[n][1]:
@@ -997,7 +1071,7 @@ def slow_decode_token_fp4(t, mode: emu.Mode, bi: int, si: int, parts: Optional[d
             if kbar is not None:
                 vbar_tiles = (vbar_tiles or []) + [kbar[i] for i in range(len(kbar))]
         E1 = [0] * 16
-        if om0.v_l1 == "grp":
+        if om0.v == "nvf4t" and om0.v_l1 == "grp":
             for g in range(16):
                 amax = float(np.abs(xv[:, 32 * g:32 * g + 32]).max())
                 if amax > 0:
@@ -1011,7 +1085,7 @@ def slow_decode_token_fp4(t, mode: emu.Mode, bi: int, si: int, parts: Optional[d
         xs = np.zeros_like(xv)
         for g in range(16):
             xs[:, 32 * g:32 * g + 32] = xv[:, 32 * g:32 * g + 32] * np.float32(2.0 ** -E1[g])
-        for j in range(nblk):
+        for j in range(nblk if om0.v == "nvf4t" else 0):
             for tokens in blocks16:
                 idx = [64 * j + tk for tk in tokens]
                 for d in range(512):
@@ -1086,7 +1160,7 @@ def slow_decode_token_fp4(t, mode: emu.Mode, bi: int, si: int, parts: Optional[d
                 tile = oms[0].v_smooth
                 for tt in range(64 // tile):
                     ti = (64 * j) // tile + tt
-                    contrib = contrib + (G * float(P64[tt * tile:(tt + 1) * tile].astype(np.float64).sum())) * vbar_tiles[ti].astype(np.float64)
+                    contrib = contrib + (G * float(P64[tt * tile:(tt + 1) * tile].astype(np.float64).sum())) * (vbar_tiles[ti].astype(np.float64) / col.astype(np.float64))
             O = (O * ss[j]).astype(np.float32)
             l = np.float32(l * ss[j] + ls)
             O = (O + contrib.astype(np.float32)).astype(np.float32)
@@ -1265,7 +1339,11 @@ def selftest_fp4() -> bool:
              ("mxfp4", "MXFP4 cache mxfp4x4 Q native + P mxfp4 + V mxf4r, eager", mx4),
              ("fp8+fp8", "fi-dsv4-nvfp4 on two FP8 caches", fi),
              ("mxfp4", "fi-dsv4-nvfp4 on the MXFP4 cache (K requantized)", fi),
-             ("fp8+fp4", "smoothing of Q, K, V (tile 32)", smooth)]
+             ("fp8+fp4", "smoothing of Q, K, V (tile 32)", smooth),
+             ("fp8+fp4", "smoothing of V (tile 32) with the first level grp, K nvf4r smoothing tile 32, sa3 ceil", emu.Mode(fp8=nv_om("nvfp4x2", k_smooth=32, v_l1="grp", v_smooth=32), mxfp4=nv_om("nvfp4x2", k_smooth=32, v_l1="grp", v_smooth=32),
+                                                                                                         fp4=nv_om("nvfp4x2", "nvf4r", k_smooth=32, v_l1="grp", v_smooth=32), p="nvfp4", p_l1="sa3", p_rule="ceil", m="lazy", B=64, accum="f64", q_rule="ceil")),
+             ("fp8+fp4", "attribution: only P in FP4 (sa3 ceil kperm, eager), QK and V exact", emu.Mode(p="nvfp4", p_l1="sa3", m="eager", B=64)),
+             ("fp8+fp4", "attribution: only V^T in FP4 (grp ceil), P float32, QK exact", emu.Mode(fp8=OMf("bf16", "exact", "nvf4t", v_l1="grp"), fp4=OMf("bf16", "exact", "nvf4t", v_l1="grp"), p="nvfp4", p_rule="exact", m="eager", B=64))]
     for cls in ("hv4", "kampw4"):
         for family, label, mode in cases:
             if cls == "kampw4" and family != "fp8+fp4":
@@ -1585,6 +1663,117 @@ def selftest_framework(verbose: bool = True) -> bool:
     return ok
 
 
+# ----------------------------------------------------------------------------------------------
+# Gate against a reference row (T-08): a combination passes when, in every cell (data class, heads) of the family, its out cos_diff and its lse error are not worse than the reference's
+# ----------------------------------------------------------------------------------------------
+GATE_RTOL = 0.01                                     # 'not worse' allows 1 % (the logits of rows with the same QK are identical, the rest differs by float32 rounding noise)
+GATE_ATOL = dict(cos_diff=1e-9, lse_max_abs=1e-6)    # and an absolute floor (1e-6 is the float32 resolution of an lse of ~10)
+TILE_WEIGHTS = (192, 576)                            # tokens of the main and the extra cache in the generated data (topk 192, extra 576)
+
+
+def mode_cost(mode: emu.Mode, family: str) -> Optional[Tuple[float, float]]:
+    """
+    A rough cost of a full FP4 pipeline row per family, token-weighted over the tiles: (MMA instructions per 8 tokens and 16 heads, extra producer / consumer work in arbitrary units).
+    MMA: QK = Q terms x 8 (k64 instructions of the FP4 kinds over the 512 dims) or x 16 (k32 mxf8f6f4), PV = 8 (one k64 instruction per 8 output columns and 64 tokens, 512 / 8 / 8).
+    Work: producer = V^T conversion (nvf4t 3, +1 first level grp, +2 Four Over Six, +0.5 ceil rule, +1 smoothing; mxf4r 1) + K re-quantization (nvf4r 2, +0.5 ceil, +2 smoothing);
+    consumer = P quantization (nvfp4 2, +0.5 ceil, +2 Four Over Six, +0.5 bf16 pre-rounding; mxfp4 1.5) + 1 for the eager max (rescale of the accumulators every tile) + 1 for the Q smoothing.
+    None for rows that are not complete FP4 pipelines (attribution rows, the other modes)
+    """
+    if mode.p not in emu.FP4_P or mode.p_rule == "exact":
+        return None
+    main, extra = FAMILIES[family]
+    tiles = [(main, TILE_WEIGHTS[0])] + ([(extra, TILE_WEIGHTS[1])] if extra else [])
+    tot = float(sum(w for _, w in tiles))
+    mma = work = 0.0
+    for layout, w in tiles:
+        om = mode.ops(layout)
+        kind, n = emu.parse_q_mode(om.q)
+        if kind == "bf16" or om.v not in ("nvf4t", "mxf4r"):
+            return None
+        prod = 0.0
+        if om.k == "nvf4r":
+            prod += 2 + (0.5 if om.k_rule == "ceil" else 0) + (2 if om.k_smooth else 0)
+        if om.v == "nvf4t":
+            prod += 3 + (1 if om.v_l1 == "grp" else 0) + (2 if om.v46 else 0) + (0.5 if om.v_rule == "ceil" else 0) + (1 if om.v_smooth else 0)
+        else:
+            prod += 1
+        mma += w * (n * (16 if kind == "mxfp8" else 8) + 8)
+        work += w * prod
+    cons = (2 + (0.5 if mode.p_rule == "ceil" else 0) + (2 if mode.p46 else 0) + (0.5 if mode.p_pre == "bf16" else 0)) if mode.p == "nvfp4" else 1.5
+    cons += (1 if mode.m == "eager" else 0) + (1 if mode.q_smooth else 0)
+    return mma / tot, work / tot + cons
+
+
+def gate_tables(rows: List[dict], combos, ref: str) -> str:
+    fams = [f for f in FAMILIES if any(r["family"] == f for r in rows)]
+    by = {}
+    for r in rows:
+        by.setdefault((r["family"], r["combo"], r["cls"], r["h"]), []).append(r)
+    cell = lambda f, n, c, h, key: max(r[key] for r in by[(f, n, c, h)])
+    mode_of = {c[0]: c[2] for c in combos}
+    desc = {c[0]: c[1] for c in combos}
+    keys = (("cos_diff", "out cos_diff"), ("lse_max_abs", "lse max abs error"))
+    out = [f"\n## Gate against `{ref}`\n",
+           f"A combination passes when in every cell (data class x heads; worst case over the repeated seeds) of the family both its out cos_diff and its lse max abs error are not worse than those of `{ref}` "
+           f"(tolerance: {GATE_RTOL:.0%} relative + {GATE_ATOL['cos_diff']:g} / {GATE_ATOL['lse_max_abs']:g} absolute; `strict` counts the cells without the tolerance). "
+           "`margin` = reference error / candidate error in the worst cell (>= 1: not worse; the cell is named). `cost` = (MMA instructions per 8 tokens and 16 heads, extra producer + consumer work), see `mode_cost`; "
+           "rows that are not complete FP4 pipelines have none.\n"]
+    summary = []
+    for f in fams:
+        cells = sorted({(r["cls"], r["h"]) for r in rows if r["family"] == f and r["combo"] == ref}, key=lambda x: (list(CLASSES).index(x[0]) if x[0] in CLASSES else -1, x[1]))
+        if not cells:
+            continue
+        main, extra = FAMILIES[f]
+        out.append(f"\n### family `{f}` (main {main.name}, extra {extra.name if extra else 'none'}), {len(cells)} cells\n")
+        out.append(f"Reference `{ref}`, worst case per cell: out cos_diff / lse max abs error\n")
+        out.append("| cell | " + " | ".join(f"{c}/{h}" for c, h in cells) + " |")
+        out.append("|---|" + "---|" * len(cells))
+        out.append("| cos_diff | " + " | ".join(fmt(cell(f, ref, c, h, "cos_diff")) for c, h in cells) + " |")
+        out.append("| lse abs | " + " | ".join(fmt(cell(f, ref, c, h, "lse_max_abs")) for c, h in cells) + " |")
+        out.append("\n| combination | cells passed (strict / with tolerance) | cos margin (worst cell) | lse margin (worst cell) | cost (MMA, work) | verdict |")
+        out.append("|---|---|---|---|---|---|")
+        passing = []
+        names = [c[0] for c in combos if c[0] != ref and all((f, c[0], cl, h) in by for cl, h in cells)]
+        for name in names:
+            res = {}
+            for key, _ in keys:
+                strict = tol = 0
+                worst, wcell = float("inf"), None
+                for cl, h in cells:
+                    a, b = cell(f, ref, cl, h, key), cell(f, name, cl, h, key)
+                    strict += b <= a + GATE_ATOL[key]
+                    tol += b <= a * (1 + GATE_RTOL) + GATE_ATOL[key]
+                    if not (a == 0 and b == 0):
+                        mg = a / b if b > 0 else float("inf")
+                        if mg < worst:
+                            worst, wcell = mg, (cl, h)
+                res[key] = (strict, tol, worst, wcell)
+            cs, ls_ = res["cos_diff"], res["lse_max_abs"]
+            both_strict = sum(1 for cl, h in cells if cell(f, name, cl, h, "cos_diff") <= cell(f, ref, cl, h, "cos_diff") + GATE_ATOL["cos_diff"]
+                              and cell(f, name, cl, h, "lse_max_abs") <= cell(f, ref, cl, h, "lse_max_abs") + GATE_ATOL["lse_max_abs"])
+            both_tol = sum(1 for cl, h in cells if cell(f, name, cl, h, "cos_diff") <= cell(f, ref, cl, h, "cos_diff") * (1 + GATE_RTOL) + GATE_ATOL["cos_diff"]
+                           and cell(f, name, cl, h, "lse_max_abs") <= cell(f, ref, cl, h, "lse_max_abs") * (1 + GATE_RTOL) + GATE_ATOL["lse_max_abs"])
+            ok = both_tol == len(cells)
+            cost = mode_cost(mode_of[name], f)
+            mg = lambda t: ("inf" if t[2] == float("inf") else f"{t[2]:.2f}") + (f" ({t[3][0]}/{t[3][1]})" if t[3] else "")
+            out.append(f"| {name} | {both_strict} / {both_tol} of {len(cells)} | {mg(cs)} | {mg(ls_)} | " + (f"{cost[0]:.0f}, {cost[1]:.1f}" if cost else "-") + f" | {'PASS' if ok else 'fail'} |")
+            if ok and cost and name.startswith("nvfp4-"):
+                passing.append((cost[0], cost[1], name, min(cs[2], ls_[2]), both_strict == len(cells)))
+        passing.sort()
+        summary.append((f, passing))
+    out.append("\n## Cheapest combinations that pass the gate\n")
+    out.append("Ordered by (MMA instructions, extra work); `margin` = the smaller of the two worst-cell margins; `strict` = also passes without the tolerance.\n")
+    for f, passing in summary:
+        out.append(f"\n- family `{f}`: " + ("none of the `nvfp4-*` rows passes" if not passing else ""))
+        for mma, work, name, mg, strict in passing[:8]:
+            out.append(f"  - `{name}`: MMA {mma:.0f}, work {work:.1f}, worst margin {mg:.2f}{'' if strict else ' (only with the tolerance)'}")
+    out.append("\n## Row definitions of the FP4 PV rows\n")
+    for c in combos:
+        if c[0].startswith("nvfp4-") or c[0] == ref:
+            out.append(f"- `{c[0]}`: {c[1]}")
+    return "\n".join(out) + "\n"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--classes", default="upstream,corner,hv1,hv4,hv16,kamp1,kamp4,kampw4,kampw16", help="Comma separated data classes (corner = all-invalid / empty rows)")
@@ -1597,6 +1786,8 @@ def main():
     ap.add_argument("--csv", default=None)
     ap.add_argument("--md", default=None)
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--gate-ref", default=None, help="Append the gate section against this combination (e.g. fi-dsv4-nvfp4) to the markdown")
+    ap.add_argument("--from-csv", default=None, help="Do not run: read the rows of an earlier --csv and write the markdown (with --md / --gate-ref)")
     ap.add_argument("--selftest", action="store_true", help="Check the emulator against an independent slow implementation")
     ap.add_argument("--selftest-fp4", action="store_true", help="Only the FP4 PV part of --selftest (nvfp4 / mxfp4 P, V^T, K requantization, FlashInfer reference row)")
     ap.add_argument("--check-exact", action="store_true", help="Run only the exact combination; exit 1 if it fails the upstream tolerances anywhere")
@@ -1612,6 +1803,27 @@ def main():
     if args.list:
         for name, desc, mode, fams in combos:
             print(f"{name:22s} {','.join(fams):40s} {desc}")
+        return
+    if args.from_csv:
+        def conv(v: str):
+            if v in ("True", "False"):
+                return v == "True"
+            for t_ in (int, float):
+                try:
+                    return t_(v)
+                except ValueError:
+                    pass
+            return v
+        with open(args.from_csv, newline="") as f:
+            rows = [{k: conv(v) for k, v in r.items()} for r in csv.DictReader(f)]
+        names = {r["combo"] for r in rows}
+        combos = [x for x in combos if x[0] in names]
+        classes = [c for c in args.classes.split(",") if c and any(r["cls"] == c for r in rows)]
+        md = summarize(rows, combos, classes)
+        if args.gate_ref:
+            md += gate_tables(rows, combos, args.gate_ref)
+        with open(args.md, "w") as f:
+            f.write(md)
         return
     pats = args.combos.split(",")
     if args.check_exact:
@@ -1632,6 +1844,8 @@ def main():
     if args.md:
         with open(args.md, "w") as f:
             f.write(summarize(rows, combos, classes))
+            if args.gate_ref:
+                f.write(gate_tables(rows, combos, args.gate_ref))
     if args.check_exact:
         bad = [r for r in rows if not (r["out_ok"] and r["lse_ok"])]
         print(f"exact mode: {len(rows) - len(bad)}/{len(rows)} cases pass the upstream tolerances")

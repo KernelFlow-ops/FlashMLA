@@ -597,7 +597,7 @@ def kperm_index(n: int, device) -> torch.Tensor:
 
 def p_gain(mode: Mode) -> float:
     """The first-level gain G of P (SageAttention3 style): P * G has its largest value at 2688 (1536 with Four Over Six); Pmax = 64 for the lazy max (threshold 6), 1 otherwise"""
-    if mode.p != "nvfp4" or mode.p_l1 != "sa3":
+    if mode.p != "nvfp4" or mode.p_l1 != "sa3" or mode.p_rule == "exact":
         return 1.0
     pmax = 1.0 if mode.m in ("final", "eager") else 2.0 ** LAZY_THRESHOLD
     return (V1_TOP_46 if mode.p46 else V1_TOP) / pmax
@@ -609,6 +609,9 @@ def quantize_p_fp4(P: torch.Tensor, mode: Mode) -> Tuple[torch.Tensor, torch.Ten
     (mxfp4). The value of token perm[i] is codes[i] * scale[i // g] / G
     """
     bs, h, N = P.shape
+    if mode.p == "nvfp4" and mode.p_rule == "exact":          # attribution only: P stays float32 (code = value, scale 1), the V^T operand is the only FP4 part
+        perm = kperm_index(N, P.device) if mode.p_group == "kperm" else None
+        return (P.index_select(-1, perm) if perm is not None else P), torch.ones(bs, h, N // 16, dtype=torch.float32, device=P.device), 1.0, perm
     x = bf16_rn(P) if mode.p_pre == "bf16" else P
     if mode.p == "mxfp4":
         xv = x.view(bs, h, N // 32, 32)
@@ -655,11 +658,16 @@ def v_fp4_terms(sds: List[ScopeData], oms: List[OperandMode], mode: Mode):
     mxf4r: the e2m1 codes of an MXFP4 cache re-based per (dimension, 32 tokens) to the largest ue8m0 exponent of the valid tokens of the 32-token tile, round to e2m1 (RN-even)
     """
     kinds = {om.v for om in oms}
-    assert len(kinds) == 1 and kinds <= {"nvf4t", "mxf4r"}, f"FP4 PV needs the same V form in all caches: {oms}"
-    assert (mode.p == "nvfp4") == (kinds == {"nvf4t"}) and (mode.p == "mxfp4") == (kinds == {"mxf4r"}), f"P {mode.p} does not match V {kinds}"
+    assert len(kinds) == 1 and kinds <= {"nvf4t", "mxf4r", "exact"}, f"FP4 PV needs the same V form in all caches: {oms}"
+    assert kinds == {"exact"} or (mode.p == "nvfp4") == (kinds == {"nvf4t"}) and (mode.p == "mxfp4") == (kinds == {"mxf4r"}), f"P {mode.p} does not match V {kinds}"
     assert mode.B == 64, "the FP4 PV instruction takes 64 tokens: the lazy-max block is the pair of 32-token tiles"
     bs = sds[0].kdeq.shape[0]
     dev = sds[0].kdeq.device
+    if kinds == {"exact"}:         # attribution only: V stays bf16 (unit scales), P is the only FP4 operand
+        g = 16 if mode.p == "nvfp4" else 32
+        codes = [sd.kdeq.float().index_select(1, kperm_index(sd.kdeq.shape[1], dev)) if (mode.p == "nvfp4" and mode.p_group == "kperm") else sd.kdeq.float() for sd in sds]
+        sfs = [torch.ones(bs, sd.kdeq.shape[1] // g, 512, dtype=torch.float32, device=dev) for sd in sds]
+        return torch.cat(codes, 1), torch.cat(sfs, 1), torch.ones(bs, 512, dtype=torch.float32, device=dev), None
     if kinds == {"mxf4r"}:
         codes, sfs = [], []
         for sd, om in zip(sds, oms):
@@ -890,7 +898,8 @@ def _pv_fp4(P: torch.Tensor, s_blk: torch.Tensor, vv: List[torch.Tensor], vsf: L
         # exact add-back of the subtracted tile means: sum over the 32-token tiles of the block of (G * rowsum of P over the tile) * vbar
         tile = N // vbar.shape[1]
         pt = P.double().view(bs, h, N // tile, tile).sum(-1) * G                                    # [bs, h, ntile]
-        comp = torch.einsum("bht,btd->bhtd", pt, vbar.double()).reshape(bs, h, nblk, 64 // tile, 512).sum(3)       # [bs, h, nblk, 512]
+        vb = vbar.double() if v_col is None else vbar.double() / v_col.double().unsqueeze(1)         # the accumulator is in the domain of V * 2^-E1 (the first level of V is undone at the end)
+        comp = torch.einsum("bht,btd->bhtd", pt, vb).reshape(bs, h, nblk, 64 // tile, 512).sum(3)       # [bs, h, nblk, 512]
     O, l = pv_fp4_core(pc, psf, vv[0], vsf[0], g, ls, s_blk, comp, budget)
     if G != 1.0:
         O = torch.div(O, torch.tensor(G, dtype=torch.float32, device=dev))
