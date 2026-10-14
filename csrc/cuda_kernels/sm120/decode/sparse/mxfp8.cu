@@ -3,8 +3,8 @@ Sparse MLA Decoding — SM120 (RTX 50 series / RTX PRO Blackwell), the block-sca
 
 Both matrix products run on the block-scaled e4m3 MMA (kind::mxf8f6f4, one power-of-two scale per row
 of A and per column of B for every 32 elements of k), which is four times as fast as the bf16 MMA on
-this architecture. The main KV cache has to be the V4.1 fp8 cache; the extra cache may be the V4.1 fp4
-cache with NUM_TERMS = 1 (EXTRA_FP4, below).
+this architecture. The main KV cache is the V4.1 fp8 cache; the extra cache may be the V4.1 fp4 cache with
+NUM_TERMS = 1 (EXTRA_FP4, below), and the main cache may be the V4.1 fp4 cache too (MAIN_FP4).
 
 - QK. K is used as stored: the e4m3 bytes of a token are the B operand and its 16 ue8m0 scales (one per
   32 dims) are the scales of its column, so nothing is lost on this side. Q is quantized once per
@@ -24,6 +24,9 @@ cache with NUM_TERMS = 1 (EXTRA_FP4, below).
   e2m1 with an e4m3 scale per head and 16 dims. For PV the producers round V once to e4m3 on a
   power-of-two scale per tile and 32 dims, which makes it a rebased tile like the others; the scale
   comes from the largest 16-dim scale of the tile (rebase_fp4_tile_part).
+- MAIN_FP4 (together with EXTRA_FP4, NUM_TERMS = 1): the main cache is a V4.1 fp4 cache, so every tile is an fp4 tile as
+  above: Q is quantized once per request, to FP4_Q_TERMS NVFP4 terms only, and all rows, of the main and of the extra
+  cache, come with one cp.async.bulk each (a 288 B row has no gather4 tensor map).
 
 The CTA holds one query token and 64 heads, as in the bf16 path (bf16.cu), and walks tiles of B_TOPK
 tokens with 8 consumer warps and 4 producer warps.
@@ -107,7 +110,7 @@ struct RingState {
 struct TileState {
     uint64_t bar_rebased[NUM_RAW_BUFS];                             // The rebase warps have written a tile to its V buffer
     uint32_t valid_mask[NUM_MASK_BUFS];                             // Bit i: token i of the tile is valid
-    uint8_t is_fp4_tile[NUM_MASK_BUFS];                             // The tile comes from the fp4 extra cache
+    uint8_t is_fp4_tile[NUM_MASK_BUFS];                             // The tile comes from the fp4 extra cache (not kept with MAIN_FP4: every tile is an fp4 tile)
 };
 struct ScaleState {
     alignas(16) uint8_t v_scale[NUM_V_BUFS][NUM_SCALE_GROUPS];      // ue8m0 of a rebased tile: one per 32 dims
@@ -203,14 +206,14 @@ __device__ __forceinline__ int load_tile_index(const SparseAttnDecodeParams &par
 // An invalid token is not read from the cache (its row there may hold NaN): a gather4 gets row -1 for it, outside the
 // tensor, which arrives as zeros, and a group without a valid token is not gathered; a bulk copy skips the token. Its
 // buffer row then holds zeros or stale bytes, whose S is discarded in the softmax.
-template<bool EXTRA_FP4>
+template<bool EXTRA_FP4, bool MAIN_FP4>
 __device__ __forceinline__ void gather_tile(
     const SparseAttnDecodeParams &params, const GatherMaps &maps, SharedMemoryPlan &plan, int index, bool is_extra_block, uint32_t raw_idx, uint32_t tile_idx
 ) {
     const int lane_idx = threadIdx.x % 32;
     const bool is_token_valid = index != -1;
     const uint32_t valid_mask = __ballot_sync(0xffffffffu, is_token_valid);
-    const bool is_fp4 = EXTRA_FP4 && is_extra_block;
+    const bool is_fp4 = EXTRA_FP4 && (MAIN_FP4 || is_extra_block);
     const uint32_t row_bytes = is_fp4 ? FP4_ROW_BYTES : ROW_BYTES;
     uint64_t *bar = &ring_state(plan).bar_raw[raw_idx];
     const uint32_t page_block_size = is_extra_block ? params.extra_page_block_size : params.page_block_size;
@@ -246,7 +249,7 @@ __device__ __forceinline__ void gather_tile(
     }
     if (lane_idx == 0) {
         tile_state(plan).valid_mask[tile_idx % NUM_MASK_BUFS] = valid_mask;
-        if (EXTRA_FP4) {
+        if (EXTRA_FP4 && !MAIN_FP4) {
             tile_state(plan).is_fp4_tile[tile_idx % NUM_MASK_BUFS] = is_fp4;
         }
         mbarrier_arrive_expect_tx(bar, num_bytes);
@@ -364,7 +367,7 @@ __device__ __forceinline__ void rebase_fp4_tile_part(SharedMemoryPlan &plan, uin
     }
 }
 
-template<bool EXTRA_FP4, bool PAIRED_V>
+template<bool EXTRA_FP4, bool MAIN_FP4, bool PAIRED_V>
 __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &params, const GatherMaps &maps, SharedMemoryPlan &plan) {
     const int partition_idx = cta_partition_idx();
     const int warp_idx = threadIdx.x / 32 - NUM_CONSUMER_WARPS;
@@ -419,7 +422,7 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
                 is_next_extra_block = cursor.block_idx >= cursor.num_orig_blocks;
                 ++cursor.block_idx;
             }
-            gather_tile<EXTRA_FP4>(params, maps, plan, index, is_extra_block, raw_idx, tile_idx);
+            gather_tile<EXTRA_FP4, MAIN_FP4>(params, maps, plan, index, is_extra_block, raw_idx, tile_idx);
             if (++raw_idx == NUM_RAW_BUFS) {
                 raw_idx = 0;
                 raw_phase ^= 1;
@@ -438,7 +441,7 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
                 // PV of the tile that was in this V buffer; its barrier completes next for this tile's PV
                 mbarrier_wait(&ring_state(plan).bar_v_free[v_idx], ((tile_idx / NUM_V_BUFS) & 1) ^ 1);
             }
-            if (EXTRA_FP4 && tile_state(plan).is_fp4_tile[tile_idx % NUM_MASK_BUFS]) {
+            if (MAIN_FP4 || (EXTRA_FP4 && tile_state(plan).is_fp4_tile[tile_idx % NUM_MASK_BUFS])) {
                 rebase_fp4_tile_part<PAIRED_V>(plan, raw_idx, v_idx, tile_idx, group_begin, group_end);
             } else {
                 rebase_tile_part<PAIRED_V>(plan, raw_idx, v_idx, tile_idx, group_begin, group_end);
@@ -951,7 +954,7 @@ __device__ __forceinline__ const bf16 *q_row(const SparseAttnDecodeParams &param
         + (int64_t)(cta_head_block() * NUM_HEADS + 16 * (warp_idx / 2) + g) * params.stride_q_h_q + (D_QK / 2) * (warp_idx % 2);
 }
 
-template<int NUM_TERMS, bool EXTRA_FP4>
+template<int NUM_TERMS, bool EXTRA_FP4, bool MAIN_FP4>
 __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan) {
     const int partition_idx = cta_partition_idx();
 
@@ -973,7 +976,20 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
         }
         float o_acc[NUM_OUT_TILES][4];  // The output tiles of this warp's 256 columns
         float mi[2], li[2];             // The softmax state of the heads g and g+8
-        if constexpr (!EXTRA_FP4) {
+        if constexpr (MAIN_FP4) {
+            // Every tile is an fp4 tile: Q is quantized for them only, before O starts to live in registers
+            if (block_idx < end_block_idx) {
+                uint32_t q_frag[FP4_Q_TERMS][4][4], q_scale[FP4_Q_TERMS][2];
+                quantize_q_nvfp4<FP4_Q_TERMS>(q_row(params, batch_idx), 8 * (int64_t)params.stride_q_h_q, q_frag, q_scale);
+                start_request(o_acc, mi, li);
+                #pragma unroll 1
+                for (; block_idx < end_block_idx; ++block_idx, ++tile_idx) {
+                    consume_tile<NUM_TERMS, true>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
+                }
+            } else {
+                start_request(o_acc, mi, li);
+            }
+        } else if constexpr (!EXTRA_FP4) {
             // Q as the A fragments of the 8 MMAs (k = 32 dims each) of this warp
             uint32_t q_frag[NUM_TERMS][8][4], q_scale[NUM_TERMS];
             quantize_q<NUM_TERMS>(q_row(params, batch_idx), 8 * (int64_t)params.stride_q_h_q, q_frag, q_scale);
@@ -1010,7 +1026,7 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
 }
 
 // The name keeps the upstream substring that the benchmark scripts look for
-template<int NUM_TERMS, bool EXTRA_FP4>
+template<int NUM_TERMS, bool EXTRA_FP4, bool MAIN_FP4 = false>
 __global__ void __launch_bounds__(NUM_THREADS, 1)
 flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecodeParams params, __grid_constant__ const GatherMaps maps) {
     extern __shared__ __align__(128) char wksp_buf[];
@@ -1036,25 +1052,29 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
     // consumers of fp8 tiles need 232.
     if (threadIdx.x < NUM_CONSUMER_THREADS) {
         setmaxnreg_inc<EXTRA_FP4 ? 224 : 232>();
-        consumer_main<NUM_TERMS, EXTRA_FP4>(params, plan);
+        consumer_main<NUM_TERMS, EXTRA_FP4, MAIN_FP4>(params, plan);
     } else {
         setmaxnreg_dec<EXTRA_FP4 ? 56 : 40>();
-        producer_main<EXTRA_FP4, NUM_TERMS == 2>(params, maps, plan);
+        producer_main<EXTRA_FP4, MAIN_FP4, NUM_TERMS == 2>(params, maps, plan);
     }
 }
 
-template<int NUM_TERMS, bool EXTRA_FP4>
+template<int NUM_TERMS, bool EXTRA_FP4, bool MAIN_FP4 = false>
 static void launch(const SparseAttnDecodeParams &params) {
+    static_assert(!MAIN_FP4 || (EXTRA_FP4 && NUM_TERMS == 1));
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
 
+    // The rows of an fp4 cache have no tensor map (rows_per_block stays 0): they are copied one by one
     GatherMaps maps;
     std::memset(&maps, 0, sizeof(maps));
-    maps.kv_rows_per_block = make_gather_map(maps.kv, params.kv, params.num_blocks, params.page_block_size, params.stride_kv_block, ROW_BYTES, ROW_BYTES);
+    if (!MAIN_FP4) {
+        maps.kv_rows_per_block = make_gather_map(maps.kv, params.kv, params.num_blocks, params.page_block_size, params.stride_kv_block, ROW_BYTES, ROW_BYTES);
+    }
     if (params.extra_topk > 0 && !EXTRA_FP4) {
         maps.extra_rows_per_block = make_gather_map(maps.extra_kv, params.extra_kv, params.extra_num_blocks, params.extra_page_block_size, params.stride_extra_kv_block, ROW_BYTES, ROW_BYTES);
     }
 
-    auto kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<NUM_TERMS, EXTRA_FP4>;
+    auto kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<NUM_TERMS, EXTRA_FP4, MAIN_FP4>;
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     kernel<<<decode_grid(params), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params, maps);
     KU_CHECK_KERNEL_LAUNCH();
@@ -1064,11 +1084,15 @@ static void launch(const SparseAttnDecodeParams &params) {
 
 void run_mxfp8(const SparseAttnDecodeParams &params, int num_terms) {
     KU_ASSERT(num_terms == 1 || num_terms == 2);
+    const bool is_main_fp4 = params.model_type == ModelType::V41_FP4;
     const bool is_extra_fp4 = params.extra_topk > 0 && params.extra_model_type == ModelType::V41_FP4;
-    KU_ASSERT(params.model_type == ModelType::V41 && (params.extra_topk == 0 || params.extra_model_type == ModelType::V41 || is_extra_fp4),
-        "the block-scaled kernel reads a V4.1 fp8 main cache and a V4.1 fp8 or fp4 extra cache");
-    KU_ASSERT(!is_extra_fp4 || num_terms == 1, "the block-scaled kernel reads an fp4 extra cache with one term only");
-    if (num_terms == 2) {
+    KU_ASSERT(is_main_fp4 ? (params.extra_topk == 0 || is_extra_fp4)
+                          : (params.model_type == ModelType::V41 && (params.extra_topk == 0 || params.extra_model_type == ModelType::V41 || is_extra_fp4)),
+        "the block-scaled kernel reads a V4.1 fp8 main cache with a V4.1 fp8 or fp4 extra cache, or a V4.1 fp4 main cache with a V4.1 fp4 extra cache");
+    KU_ASSERT(!(is_main_fp4 || is_extra_fp4) || num_terms == 1, "the block-scaled kernel reads fp4 caches with one term only");
+    if (is_main_fp4) {
+        mxfp8_path::launch<1, true, true>(params);
+    } else if (num_terms == 2) {
         mxfp8_path::launch<2, false>(params);
     } else if (is_extra_fp4) {
         mxfp8_path::launch<1, true>(params);

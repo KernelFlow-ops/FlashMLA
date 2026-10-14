@@ -3,8 +3,8 @@ Sparse MLA Decoding — SM120 (RTX 50 series / RTX PRO Blackwell), the bf16 path
 
 The same arithmetic as the sm100 decoding kernels (bf16 Q, KV dequantized to bf16, fp32 accumulation,
 online softmax with lazy rescaling), built on warp-level mma.sync because sm120 has neither tcgen05 /
-TMEM nor wgmma. `kv` is the V4.1 fp8 cache; `extra_kv` is that or the V4.1 fp4 one. Supports attn_sink,
-topk_length, the extra cache and split-KV.
+TMEM nor wgmma. `kv` is the V4.1 fp8 cache or the V4.1 fp4 one; `extra_kv` is that or, next to an fp8 `kv`,
+the fp4 one. Supports attn_sink, topk_length, the extra cache and split-KV.
 
 One CTA handles one query token and 64 heads (cta_head_block() selects the heads, so h_q = 128 runs two
 CTAs per query token), and walks its KV tokens in tiles of B_TOPK.
@@ -101,6 +101,7 @@ __device__ __forceinline__ void dequant_fp4_row_part(const uint8_t *row, int par
     }
 }
 
+template<bool MAIN_FP4>
 __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan) {
     const int s_q_idx = cta_s_q_idx();
     const int partition_idx = cta_partition_idx();
@@ -122,7 +123,7 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
         #pragma unroll 1
         for (int block_idx = req.start_block_idx; block_idx < req.end_block_idx; ++block_idx, ++tile_idx) {
             const bool is_extra_block = block_idx >= req.num_orig_blocks;
-            const bool is_fp4 = is_extra_block && params.extra_model_type == ModelType::V41_FP4;
+            const bool is_fp4 = MAIN_FP4 || (is_extra_block && params.extra_model_type == ModelType::V41_FP4);
             const uint32_t row_bytes = is_fp4 ? Fp4Format::BYTES_PER_TOKEN : Fp8Format::BYTES_PER_TOKEN;
 
             if (warp_idx == 0) {
@@ -375,7 +376,8 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
     }
 }
 
-// The name keeps the upstream substring that the benchmark scripts look for
+// The name keeps the upstream substring that the benchmark scripts look for. MAIN_FP4: the main cache is the fp4 cache (so is the extra cache, if any)
+template<bool MAIN_FP4>
 __global__ void __launch_bounds__(NUM_THREADS, 1)
 flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecodeParams params) {
     extern __shared__ __align__(128) char wksp_buf[];
@@ -397,21 +399,29 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
         consumer_main(params, plan);
     } else {
         setmaxnreg_dec<40>();
-        producer_main(params, plan);
+        producer_main<MAIN_FP4>(params, plan);
     }
+}
+
+template<bool MAIN_FP4>
+static void launch(const SparseAttnDecodeParams &params) {
+    constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+    static_assert(smem_size <= 99 * 1024);  // The limit of a block on sm120
+
+    auto kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<MAIN_FP4>;
+    KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    kernel<<<decode_grid(params), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params);
+    KU_CHECK_KERNEL_LAUNCH();
 }
 
 }   // namespace bf16_path
 
 void run_bf16(const SparseAttnDecodeParams &params) {
-    using namespace bf16_path;
-    constexpr size_t smem_size = sizeof(SharedMemoryPlan);
-    static_assert(smem_size <= 99 * 1024);  // The limit of a block on sm120
-
-    auto kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel;
-    KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    kernel<<<decode_grid(params), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params);
-    KU_CHECK_KERNEL_LAUNCH();
+    if (params.model_type == ModelType::V41_FP4) {
+        bf16_path::launch<true>(params);
+    } else {
+        bf16_path::launch<false>(params);
+    }
 }
 
 }

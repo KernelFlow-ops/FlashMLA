@@ -37,9 +37,13 @@ void run_sparse_decode(const SparseAttnDecodeParams &params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.d_qk == 512);
     KU_ASSERT(params.d_v == 512);
-    KU_ASSERT(params.model_type == ModelType::V41 || params.model_type == ModelType::V41_MXFP4, "the main KV cache must be the V4.1 fp8 cache or the MXFP4 cache");
+    KU_ASSERT(params.model_type == ModelType::V41 || params.model_type == ModelType::V41_MXFP4 || params.model_type == ModelType::V41_FP4,
+        "the main KV cache must be the V4.1 fp8 cache, the V4.1 fp4 cache or the MXFP4 cache");
     if (params.model_type == ModelType::V41_MXFP4) {
         KU_ASSERT(params.extra_topk == 0 || params.extra_model_type == ModelType::V41_MXFP4, "an MXFP4 main KV cache takes an MXFP4 extra cache only");
+    } else if (params.model_type == ModelType::V41_FP4) {
+        KU_ASSERT(params.extra_topk == 0 || params.extra_model_type == ModelType::V41_FP4,
+            "a V4.1 fp4 main KV cache takes a V4.1 fp4 extra cache only: the tiles of the two caches have different layouts and no kernel reads them side by side");
     } else {
         KU_ASSERT(params.extra_model_type == ModelType::V41 || params.extra_model_type == ModelType::V41_FP4);
     }
@@ -78,8 +82,9 @@ void run_sparse_decode(const SparseAttnDecodeParams &params) {
     }
     KU_ASSERT(arithmetic != Arithmetic::MXFP4X4, "FLASH_MLA_SM120_DECODE_MODE=mxfp4x4 is for MXFP4 KV caches only");
     const bool is_extra_fp4 = params.extra_topk > 0 && params.extra_model_type == ModelType::V41_FP4;
-    // fp8x2 has no fp4 extra cache path: one e4m3 term of V on an fp4 tile is outside the tolerance of the upstream tests
-    if (arithmetic == Arithmetic::BF16 || (arithmetic == Arithmetic::FP8X2 && is_extra_fp4)) {
+    const bool has_fp4_tiles = is_extra_fp4 || params.model_type == ModelType::V41_FP4;
+    // fp8x2 has no fp4 tile path (main or extra cache): one e4m3 term of V on an fp4 tile is outside the tolerance of the upstream tests
+    if (arithmetic == Arithmetic::BF16 || (arithmetic == Arithmetic::FP8X2 && has_fp4_tiles)) {
         run_bf16(params);
     } else {
         run_mxfp8(params, arithmetic == Arithmetic::FP8X2 ? 2 : 1);

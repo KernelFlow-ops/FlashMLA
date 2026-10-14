@@ -13,7 +13,8 @@ static constexpr int B_TOPK = 32;
 //   bf16 (default)  bf16.cu: bf16 Q, KV dequantized to bf16, the arithmetic of the sm100 kernels
 //   fp8x2           mxfp8.cu with two e4m3 terms for Q and P: within the tolerance of bf16, half the MMA cycles
 //   mxfp8           mxfp8.cu with one e4m3 term: a quarter of the MMA cycles, 4 significant bits of Q and P
-// The fp8 kernels read V4.1 fp8 caches only; with an fp4 extra cache the bf16 kernel runs whatever the mode.
+// The fp8 kernels read V4.1 fp8 main caches (and, in the mxfp8 mode, V4.1 fp4 extra caches or a V4.1 fp4 main cache); the fp4 tiles of fp8x2 (a V4.1
+// fp4 extra cache, or a V4.1 fp4 main cache with or without an fp4 extra cache) run the bf16 kernel, which is exact on them.
 // An MXFP4 main cache (and an MXFP4 extra cache, if any) is read by mxfp4.cu, on the fp4 MMA for QK and the e4m3 MMA for PV:
 //   mxfp4x4                 Q as 4 MXFP4 terms, P as two e4m3 terms: the output is within the upstream tolerance, the LSE of a query token with a
 //                           single valid KV token is off by up to 3e-6 (limit 1e-6)
