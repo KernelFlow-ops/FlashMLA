@@ -6,7 +6,7 @@ online softmax with lazy rescaling), built on warp-level mma.sync because sm120 
 TMEM nor wgmma. `kv` is the V4.1 fp8 cache; `extra_kv` is that or the V4.1 fp4 one. Supports attn_sink,
 topk_length, the extra cache and split-KV.
 
-One CTA handles one query token and 64 heads (blockIdx.z selects the heads, so h_q = 128 runs two
+One CTA handles one query token and 64 heads (cta_head_block() selects the heads, so h_q = 128 runs two
 CTAs per query token), and walks its KV tokens in tiles of B_TOPK.
 
 NUM_THREADS = 384 (3 warpgroups)
@@ -102,8 +102,8 @@ __device__ __forceinline__ void dequant_fp4_row_part(const uint8_t *row, int par
 }
 
 __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan) {
-    const int s_q_idx = blockIdx.x;
-    const int partition_idx = blockIdx.y;
+    const int s_q_idx = cta_s_q_idx();
+    const int partition_idx = cta_partition_idx();
     const int warp_idx = threadIdx.x / 32 - NUM_CONSUMER_WARPS;
     const int lane_idx = threadIdx.x % 32;
 
@@ -179,9 +179,9 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
 }
 
 __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan) {
-    const int s_q_idx = blockIdx.x;
-    const int partition_idx = blockIdx.y;
-    const int head_base = blockIdx.z * NUM_HEADS;
+    const int s_q_idx = cta_s_q_idx();
+    const int partition_idx = cta_partition_idx();
+    const int head_base = cta_head_block() * NUM_HEADS;
     const int warp_idx = threadIdx.x / 32;
     const int lane_idx = threadIdx.x % 32;
     const int m_tile = warp_idx % 4;    // QK: the heads [16*m_tile, +16) ...
@@ -410,7 +410,7 @@ void run_bf16(const SparseAttnDecodeParams &params) {
 
     auto kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel;
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    kernel<<<dim3(params.s_q, params.enable_split_kv ? params.num_sm_parts : params.b, params.h_q / NUM_HEADS), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params);
+    kernel<<<decode_grid(params), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params);
     KU_CHECK_KERNEL_LAUNCH();
 }
 

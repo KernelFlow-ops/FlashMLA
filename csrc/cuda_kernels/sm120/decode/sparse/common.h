@@ -33,6 +33,16 @@ static constexpr float RESCALE_THRESHOLD = 6.0f;    // The running max of a head
 
 static_assert(B_TOPK == 32 && D_QK == D_V);
 
+// Grid: x = block of 64 heads, y = query token, z = request (or partition with split-KV). The CTAs of the head blocks
+// and query tokens of a request are launched next to each other, so that the rows they share come from L2.
+__device__ __forceinline__ int cta_head_block() { return blockIdx.x; }
+__device__ __forceinline__ int cta_s_q_idx() { return blockIdx.y; }
+__device__ __forceinline__ int cta_partition_idx() { return blockIdx.z; }
+
+inline dim3 decode_grid(const SparseAttnDecodeParams &params) {
+    return dim3(params.h_q / NUM_HEADS, params.s_q, params.enable_split_kv ? params.num_sm_parts : params.b);
+}
+
 enum NamedBarriers : uint32_t {
     s_exchanged = 1,
     softmax_done = 2
@@ -95,8 +105,8 @@ __device__ __forceinline__ void finish_request(
     const SparseAttnDecodeParams &params, int partition_idx, int batch_idx,
     const float4 *softmax_state, float *row_scale, const float (&o_acc)[4][8][4]
 ) {
-    const int s_q_idx = blockIdx.x;
-    const int head_base = blockIdx.z * NUM_HEADS;
+    const int s_q_idx = cta_s_q_idx();
+    const int head_base = cta_head_block() * NUM_HEADS;
     const int warp_idx = threadIdx.x / 32;
     const int lane_idx = threadIdx.x % 32;
     const int m_tile = warp_idx % 4;

@@ -90,7 +90,7 @@ __device__ __forceinline__ void enter_request(TileCursor &cursor, const SparseAt
 // The cache position of each token of the tile under `cursor`, one lane per token; -1 = not a token.
 // A load from global memory that has not been touched before: the gather warp issues it one tile ahead.
 __device__ __forceinline__ int load_tile_index(const SparseAttnDecodeParams &params, const TileCursor &cursor) {
-    const int s_q_idx = blockIdx.x;
+    const int s_q_idx = cta_s_q_idx();
     const int lane_idx = threadIdx.x % 32;
     const bool is_extra_block = cursor.block_idx >= cursor.num_orig_blocks;
     const int pos = (is_extra_block ? cursor.block_idx - cursor.num_orig_blocks : cursor.block_idx) * B_TOPK + lane_idx;
@@ -177,7 +177,7 @@ __device__ __forceinline__ void rebase_tile_part(SharedMemoryPlan &plan, uint32_
 }
 
 __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan) {
-    const int partition_idx = blockIdx.y;
+    const int partition_idx = cta_partition_idx();
     const int warp_idx = threadIdx.x / 32 - NUM_CONSUMER_WARPS;
     const int lane_idx = threadIdx.x % 32;
 
@@ -348,9 +348,9 @@ __device__ __forceinline__ void pv_step(float (&o_acc)[4], const uint32_t (&p_fr
 
 template<int NUM_TERMS>
 __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &params, SharedMemoryPlan &plan) {
-    const int s_q_idx = blockIdx.x;
-    const int partition_idx = blockIdx.y;
-    const int head_base = blockIdx.z * NUM_HEADS;
+    const int s_q_idx = cta_s_q_idx();
+    const int partition_idx = cta_partition_idx();
+    const int head_base = cta_head_block() * NUM_HEADS;
     const int warp_idx = threadIdx.x / 32;
     const int lane_idx = threadIdx.x % 32;
     const int m_tile = warp_idx % 4;    // QK: the heads [16*m_tile, +16) ...
@@ -619,7 +619,7 @@ static void launch(const SparseAttnDecodeParams &params) {
 
     auto kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<NUM_TERMS>;
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    kernel<<<dim3(params.s_q, params.enable_split_kv ? params.num_sm_parts : params.b, params.h_q / NUM_HEADS), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params);
+    kernel<<<decode_grid(params), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params);
     KU_CHECK_KERNEL_LAUNCH();
 }
 
