@@ -19,6 +19,7 @@ import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 import kernelkit as kk
@@ -788,6 +789,532 @@ def slow_decode_token(t, mode: emu.Mode, bi: int, si: int) -> Tuple[torch.Tensor
     return torch.stack(outs), torch.stack(lses)
 
 
+# ----------------------------------------------------------------------------------------------
+# FP4 PV (T-08): independent scalar implementations (python loops over tokens / dimensions / groups, numpy float32, the small float tables) and their comparison with the vectorized code
+# ----------------------------------------------------------------------------------------------
+_T_E4M3 = emu._small_float_table(3, 7, 0x7E)
+_T_E2M1 = emu._small_float_table(1, 1, 7)
+
+
+def _exp2_f32(x):
+    """exp2 of a float32 numpy array, evaluated by the device (the same implementation as the vectorized code; exp2 itself is not under test)"""
+    return torch.exp2(torch.tensor(np.asarray(x, dtype=np.float32), device="cuda")).cpu().numpy()
+
+
+def slow_nv_group(x, rule: str, four_six: bool):
+    """One NVFP4 group (numpy float32 [16]) quantized with python scalars: (codes [16 python floats], scale python float). See emu.nv_quant for the rules"""
+    def one(qmax: float):
+        amax = float(np.abs(x).max())
+        if rule == "ceil":
+            s = next((v for v in _T_E4M3[1:] if qmax * v >= amax), _T_E4M3[-1])          # the smallest e4m3 value with qmax * s >= amax, at least 2^-9
+            inv = np.float32(1.0) / np.float32(s)
+        else:
+            s = emu._table_round(float(np.float32(amax) / np.float32(qmax)), _T_E4M3)    # e4m3_rn(amax / qmax), IEEE float32 division, saturating, subnormals kept
+            inv = np.float32(0.0) if s == 0.0 else np.float32(1.0) / np.float32(s)
+        return [emu._table_round(float(np.float32(xi) * inv), _T_E2M1) for xi in x], s
+    c6, s6 = one(6.0)
+    if not four_six:
+        return c6, s6
+    c4, s4 = one(4.0)
+    e6 = sum((float(xi) - ci * s6) ** 2 for xi, ci in zip(x, c6))
+    e4 = sum((float(xi) - ci * s4) ** 2 for xi, ci in zip(x, c4))
+    return (c4, s4) if e4 < e6 else (c6, s6)
+
+
+def slow_kperm_blocks():
+    """The four 16-token scale blocks of a pair of tiles, derived from the fragment layouts instead of the closed form: S accumulator (n, t, j) -> token 8 n + 2 t + j; A fragment: k = 8 t + 2 (n % 4) + j (+ 32 for n >= 4)"""
+    blocks = {}
+    for n in range(8):
+        for t in range(4):
+            for j in range(2):
+                token = 8 * n + 2 * t + j
+                k = 8 * t + 2 * (n % 4) + j + (32 if n >= 4 else 0)
+                blocks.setdefault(k // 16, []).append(token)
+    return [sorted(blocks[b]) for b in range(4)]
+
+
+def slow_p_block(P64, mode: emu.Mode):
+    """
+    One block of 64 tokens of P (numpy float32 [64], the unquantized numerators of one row) -> (dequantized values in the G-scaled domain, numpy float64 [64], G). nvfp4: bf16 rounding (p_pre),
+    G = p_gain, scale groups of 16 tokens (kperm: slow_kperm_blocks(), contig: consecutive), ue4m3 scale rule; mxfp4: the 32-token tiles, ue8m0 scale 2^ceil(log2(fp32(amax) * fp32(1 / 6)))
+    """
+    x = P64.astype(np.float32)
+    if mode.p_pre == "bf16":
+        x = torch.from_numpy(x).to(torch.bfloat16).float().numpy()
+    deq = np.zeros(64)
+    if mode.p == "mxfp4":
+        for tile in range(2):
+            xt = x[32 * tile:32 * tile + 32]
+            y = np.float32(float(np.abs(xt).max())) * np.float32(emu.Q_RECIP_6)
+            e = 0 if y == 0 else _ceil_log2_py(float(y))
+            for k in range(32):
+                deq[32 * tile + k] = emu._table_round(float(xt[k] / np.float32(2.0 ** e)), _T_E2M1) * 2.0 ** e
+        return deq, 1.0
+    G = emu.p_gain(mode)
+    if G != 1.0:
+        x = (x * np.float32(G)).astype(np.float32)
+    blocks = slow_kperm_blocks() if mode.p_group == "kperm" else [list(range(16 * i, 16 * i + 16)) for i in range(4)]
+    for tokens in blocks:
+        codes, s = slow_nv_group(x[tokens], mode.p_rule, mode.p46)
+        for tk, c in zip(tokens, codes):
+            deq[tk] = c * s
+    return deq, G
+
+
+def slow_decode_token_fp4(t, mode: emu.Mode, bi: int, si: int, parts: Optional[dict] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Scalar implementation of simulate_decode for the FP4 PV modes (mode.p = nvfp4 / mxfp4) for one query token: explicit loops over tokens, heads, dimensions and scale groups; the cache bytes are
+    decoded here (not by sm120_emu). Returns (out [h, 512] bf16, lse [h]); if `parts` is a dict, the dequantized V' (before the output column multiplier, natural token order) and the column multiplier are stored in it
+    """
+    assert mode.p in emu.FP4_P and mode.B == 64 and mode.sum == "exact"
+    q = t.q[bi, si].float().cpu()
+    h = q.shape[0]
+    scopes = [t.kv_scope] + ([t.extra_kv_scope] if t.extra_kv_scope is not None else [])
+    toks = []
+    for sc in scopes:
+        layout = sc.kvcache_layout or L.V41_FP8Sparse
+        rows = sc.blocked_k_quantized.view(torch.uint8).reshape(-1, layout.get_bytes_per_token())
+        kd = sc.blocked_k.reshape(-1, 512)
+        idx = sc.indices_in_kvcache[bi, si].tolist()
+        tl = int(sc.topk_length[bi]) if sc.topk_length is not None else len(idx)
+        sub = []
+        for n, ix in enumerate(idx):
+            if ix == -1 or n >= tl:
+                sub.append((layout, False, None, None))
+            else:
+                sub.append((layout, True, rows[ix].cpu(), kd[ix].float().cpu().numpy()))
+        while len(sub) % 64:
+            sub.append((layout, False, None, None))
+        toks += sub
+    N = len(toks)
+    nblk = N // 64
+    valid_arr = np.array([tk[1] for tk in toks])
+    qrule = None if mode.q_rule == "legacy" else mode.q_rule
+
+    # ---- tile means (smoothing)
+    def tile_means(lo: int, hi: int, tile: int):
+        """means of the exact K over the valid tokens of the tiles of positions lo .. hi: {tile index (relative to lo): float32 [512]}"""
+        out = {}
+        for k0 in range(lo, hi, tile):
+            vs = [toks[n][3].astype(np.float64) for n in range(k0, k0 + tile) if toks[n][1]]
+            out[(k0 - lo) // tile] = (np.sum(vs, axis=0) / len(vs)).astype(np.float32) if vs else np.zeros(512, np.float32)
+        return out
+
+    scope_ranges, pos = [], 0
+    for sc in scopes:
+        topk = sc.indices_in_kvcache.shape[-1]
+        n_sc = topk + (-topk) % 64
+        scope_ranges.append((pos, pos + n_sc))
+        pos += n_sc
+
+    # ---- Q (the NVFP4 / MXFP4 / MXFP8 Q quantizers are checked apart against scalar implementations)
+    qbar_h = None
+    qmain = q
+    if mode.q_smooth:
+        hg = 64 if h % 64 == 0 else h
+        qbar_g = q.view(h // hg, hg, 512).double().mean(1).float()
+        qbar_h = qbar_g.repeat_interleave(hg, dim=0)                                             # [h, 512]
+        qmain = (q.view(h // hg, hg, 512) - qbar_g.unsqueeze(1)).view(h, 512)
+
+    # ---- K operands: dense float64 vectors of the terms; per token compensation of the K smoothing
+    kterm, kcomp_mean = [None] * N, [None] * N
+    qk_kinds = {}
+    for si_, (lo, hi) in enumerate(scope_ranges):
+        layout = toks[lo][0]
+        om = mode.ops(layout)
+        qk_kinds[si_] = om
+        kbar = tile_means(lo, hi, om.k_smooth) if om.k_smooth else None
+        for n in range(lo, hi):
+            layout, valid, row, kdeq = toks[n]
+            if not valid:
+                continue
+            kind, _ = emu.parse_q_mode(om.q)
+            if kind == "mxfp8":
+                kterm[n] = [c.double() * torch.tensor([2.0 ** e for e in ex], dtype=torch.float64).repeat_interleave(32)
+                            for c, ex in _slow_token_terms8(layout, row, "x1" if om.k == "native" else om.k[2:], mode.k_lo_shift)]
+                continue
+            if om.k == "nvf4r":
+                xk = kdeq
+                if om.k_smooth:
+                    kbar_t = kbar[(n - lo) // om.k_smooth]
+                    xk = (kdeq - kbar_t).astype(np.float32)
+                    kcomp_mean[n] = kbar_t
+                dense = np.zeros(512)
+                for g in range(32):
+                    codes, s = slow_nv_group(xk[16 * g:16 * g + 16], om.k_rule, False)
+                    dense[16 * g:16 * g + 16] = np.array(codes) * s
+                kterm[n] = [torch.from_numpy(dense)]
+                continue
+            vals = []
+            for i in range(256):
+                byte = int(row[i])
+                for code in (byte & 0xF, byte >> 4):
+                    vals.append((-1.0 if code & 8 else 1.0) * _E2M1_TAB[code & 7])
+            vals = torch.tensor(vals, dtype=torch.float64)
+            if layout == L.V41_FP4Sparse:
+                kterm[n] = [vals * row[256:288].view(torch.float8_e4m3fn).double().repeat_interleave(16)]
+            else:
+                kterm[n] = [vals * torch.tensor([2.0 ** (int(x) - 127) for x in row[256:272]], dtype=torch.float64).repeat_interleave(32)]
+
+    # ---- V operand: dequantized V' per token (natural order, float64) and the column multiplier
+    vdeq = np.zeros((N, 512))
+    col = np.ones(512, dtype=np.float32)
+    vbar_tiles = None
+    oms = [mode.ops(toks[lo][0]) for lo, hi in scope_ranges]
+    blocks16 = slow_kperm_blocks() if (mode.p == "nvfp4" and mode.p_group == "kperm") else [list(range(16 * i, 16 * i + 16)) for i in range(4)]
+    if mode.p == "mxfp4":
+        for si_, (lo, hi) in enumerate(scope_ranges):
+            assert oms[si_].v == "mxf4r"
+            tok_vals, tok_exps = {}, {}
+            for n in range(lo, hi):
+                if toks[n][1]:
+                    row = toks[n][2]
+                    vals = []
+                    for i in range(256):
+                        byte = int(row[i])
+                        for code in (byte & 0xF, byte >> 4):
+                            vals.append((-1.0 if code & 8 else 1.0) * _E2M1_TAB[code & 7])
+                    tok_vals[n], tok_exps[n] = np.array(vals), [int(x) - 127 for x in row[256:272]]
+            for k0 in range(lo, hi, 32):
+                vs = [n for n in range(k0, k0 + 32) if toks[n][1]]
+                for g in range(16):
+                    if not vs:
+                        continue
+                    emax = max(tok_exps[n][g] for n in vs)
+                    for n in vs:
+                        for d in range(32 * g, 32 * g + 32):
+                            vdeq[n, d] = emu._table_round(tok_vals[n][d] * 2.0 ** (tok_exps[n][g] - emax), _T_E2M1) * 2.0 ** emax
+    else:
+        om0 = oms[0]
+        assert all(o.v == "nvf4t" for o in oms)
+        top = emu.V1_TOP_46 if om0.v46 else emu.V1_TOP
+        xv = np.zeros((N, 512), dtype=np.float32)
+        for si_, (lo, hi) in enumerate(scope_ranges):
+            kbar = tile_means(lo, hi, om0.v_smooth) if om0.v_smooth else None
+            for n in range(lo, hi):
+                if toks[n][1]:
+                    xv[n] = toks[n][3] - kbar[(n - lo) // om0.v_smooth] if om0.v_smooth else toks[n][3]
+            if kbar is not None:
+                vbar_tiles = (vbar_tiles or []) + [kbar[i] for i in range(len(kbar))]
+        E1 = [0] * 16
+        if om0.v_l1 == "grp":
+            for g in range(16):
+                amax = float(np.abs(xv[:, 32 * g:32 * g + 32]).max())
+                if amax > 0:
+                    e = math.ceil(math.log2(amax / top))
+                    while amax > top * 2.0 ** e:
+                        e += 1
+                    while amax <= top * 2.0 ** (e - 1):
+                        e -= 1
+                    E1[g] = e
+                col[32 * g:32 * g + 32] = np.float32(2.0 ** E1[g])
+        xs = np.zeros_like(xv)
+        for g in range(16):
+            xs[:, 32 * g:32 * g + 32] = xv[:, 32 * g:32 * g + 32] * np.float32(2.0 ** -E1[g])
+        for j in range(nblk):
+            for tokens in blocks16:
+                idx = [64 * j + tk for tk in tokens]
+                for d in range(512):
+                    codes, s = slow_nv_group(xs[idx, d].astype(np.float32), om0.v_rule, om0.v46)
+                    for n, c in zip(idx, codes):
+                        vdeq[n, d] = c * s
+    if parts is not None:
+        parts["vdeq"], parts["col"] = vdeq, col
+
+    # ---- per head
+    scale = np.float32(float(torch.tensor(t.sm_scale * emu.LOG2E, dtype=torch.float32)))
+    G = emu.p_gain(mode)
+    outs, lses = [], []
+    for hd in range(h):
+        qcache = {}
+        logit = np.zeros(N, dtype=np.float32)
+        for n, (layout, valid, row, kdeq) in enumerate(toks):
+            if not valid:
+                continue
+            si_ = next(i for i, (lo, hi) in enumerate(scope_ranges) if lo <= n < hi)
+            om = oms[si_]
+            if (om.q, om.q_src) not in qcache:
+                qt = emu.quantize_q(emu.source_q(qmain[hd:hd + 1], om, mode), om.q, mode.q_lo_shift, mode.q_kernel_rule, qrule)
+                qcache[(om.q, om.q_src)] = ([(v[0].double() * s_[0].double().repeat_interleave(qt.g)).numpy() for v, s_ in zip(qt.vals, qt.sf)], qt.k_step)
+            qd, ks = qcache[(om.q, om.q_src)]
+            pairs = [(i, j) for i in range(len(qd)) for j in range(len(kterm[n])) if mode.lolo or not (i > 0 and j > 0)]
+            kd_ = [k_.numpy() for k_ in kterm[n]]
+            if mode.accum == "f64":
+                logit[n] = np.float32(sum(float((qd[i] * kd_[j]).sum()) for i, j in pairs))
+            else:
+                acc = np.float32(0.0)
+                for st in range(512 // ks):
+                    for i, j in pairs:
+                        acc = np.float32(acc + np.float32(float((qd[i][ks * st:ks * st + ks] * kd_[j][ks * st:ks * st + ks]).sum())))
+                logit[n] = acc
+            if qbar_h is not None:
+                logit[n] = np.float32(logit[n] + np.float32(float((qbar_h[hd].double().numpy() * kdeq.astype(np.float64)).sum())))
+            if kcomp_mean[n] is not None:
+                logit[n] = np.float32(logit[n] + np.float32(float((q[hd].double().numpy() * kcomp_mean[n].astype(np.float64)).sum())))
+        l2 = np.where(valid_arr, logit * scale, np.float32(-np.inf)).astype(np.float32)
+        bmax = l2.reshape(nblk, 64).max(1)
+        if mode.m == "final":
+            rm = bmax.max()
+            ms, ss = [np.float32(0.0 if np.isinf(rm) else rm)] * nblk, [np.float32(1.0)] * nblk
+        else:
+            thr = np.float32(0.0 if mode.m == "eager" else emu.LAZY_THRESHOLD)
+            m = np.float32(emu.MAX_INIT_VAL)
+            ms, ss = [], []
+            for j in range(nblk):
+                if np.float32(bmax[j] - m) > thr:
+                    s_ = _exp2_f32(np.float32(np.float32(m) - np.float32(bmax[j])))
+                    m = np.float32(bmax[j])
+                else:
+                    s_ = np.float32(1.0)
+                ms.append(m), ss.append(np.float32(s_))
+        # numerators of every block (device exp2 on the float32 argument)
+        arg = np.zeros(N, dtype=np.float32)
+        for j in range(nblk):
+            for k in range(64):
+                n = 64 * j + k
+                if valid_arr[n]:
+                    arg[n] = np.float32(np.float64(logit[n]) * np.float64(scale) - np.float64(ms[j]))
+        Pall = np.where(valid_arr, _exp2_f32(arg), np.float32(0.0)).astype(np.float32)
+        O = np.zeros(512, dtype=np.float32)
+        l = np.float32(0.0)
+        for j in range(nblk):
+            P64 = Pall[64 * j:64 * j + 64]
+            pdeq, _ = slow_p_block(P64, mode)
+            ls = np.float32(P64.astype(np.float64).sum())
+            contrib = pdeq @ vdeq[64 * j:64 * j + 64]                                              # exact in float64: the 64 products of one instruction
+            if vbar_tiles is not None:
+                tile = oms[0].v_smooth
+                for tt in range(64 // tile):
+                    ti = (64 * j) // tile + tt
+                    contrib = contrib + (G * float(P64[tt * tile:(tt + 1) * tile].astype(np.float64).sum())) * vbar_tiles[ti].astype(np.float64)
+            O = (O * ss[j]).astype(np.float32)
+            l = np.float32(l * ss[j] + ls)
+            O = (O + contrib.astype(np.float32)).astype(np.float32)
+        if G != 1.0:
+            O = (O / np.float32(G)).astype(np.float32)
+        O = (O * col).astype(np.float32)
+        sink = float(t.attn_sink[hd]) * emu.LOG2E if t.attn_sink is not None else -math.inf
+        mlast = ms[-1]
+        if l == 0:
+            outs.append(torch.zeros(512, dtype=torch.bfloat16)), lses.append(torch.tensor(math.inf))
+            continue
+        den = np.float32(l + np.float32(_exp2_f32(np.float32(sink - float(mlast))) if np.isfinite(sink) else (0.0 if sink < 0 else np.inf)))
+        outs.append(torch.from_numpy((O * np.float32(1.0 / den)).astype(np.float32)).to(torch.bfloat16))
+        lses.append(torch.tensor(float(np.float32(mlast) * np.float32(emu.LN2) + np.log(l)), dtype=torch.float32))
+    return torch.stack(outs), torch.stack(lses)
+
+
+def selftest_fp4() -> bool:
+    """T-08 primitives against independent scalar implementations"""
+    ok = True
+
+    def report(name, passed, detail=""):
+        nonlocal ok
+        ok &= bool(passed)
+        print(f"[{'PASS' if passed else 'FAIL'}] {name} {detail}", flush=True)
+
+    g = torch.Generator(device="cuda").manual_seed(5)
+    # (1) nv_quant: rules x Four Over Six on groups of every magnitude, zero groups, scale boundaries, saturation
+    ng = 1500
+    gain = torch.exp2(torch.rand(ng, 1, generator=g, device="cuda") * 30 - 18)
+    xg = torch.randn(ng, 16, generator=g, device="cuda") * gain
+    xg[:100] = 0.0                                                                    # zero groups
+    xg[100:200] = xg[100:200] * (torch.rand(100, 16, generator=g, device="cuda") < 0.15)         # sparse groups
+    tab = torch.tensor(_T_E4M3[1:], dtype=torch.float64, device="cuda")
+    bnd = (tab[torch.randint(0, tab.numel(), (150,), generator=g, device="cuda")] * 6.0)         # amax exactly 6 * (an e4m3 value) and its float32 neighbours
+    bnd = bnd.float() * torch.tensor([1.0, 1.0 + 2.0 ** -23, 1.0 - 2.0 ** -23], device="cuda")[torch.randint(0, 3, (150,), generator=g, device="cuda")]
+    xg[200:350] = xg[200:350] / xg[200:350].abs().amax(-1, keepdim=True) * bnd.unsqueeze(-1)
+    xg[350:380] = xg[350:380] * 1e6                                                   # beyond 6 * 448: saturation
+    xg[380:410] = xg[380:410] * 1e-9                                                  # below the scale floor
+    xg = xg.to(torch.bfloat16).float()
+    xg[410:450] = xg[410:450] * (1.0 + 2.0 ** -20)                                    # float32 values that are not bf16
+    for rule in ("ceil", "rn"):
+        for fs in (False, True):
+            c, s = emu.nv_quant(xg, rule, fs)
+            xs = xg.cpu().numpy()
+            bad = 0
+            cc, ss_ = c.cpu().numpy(), s.cpu().numpy()
+            for i in range(ng):
+                codes, sc = slow_nv_group(xs[i], rule, fs)
+                bad += not (np.array_equal(cc[i], np.array(codes, dtype=np.float32)) and float(ss_[i]) == sc)
+            report(f"nv_quant [{rule}{' 4/6' if fs else ''}] == scalar implementation", bad == 0, f"({bad} of {ng} groups differ)")
+    # fdiv is the IEEE division, and differs from torch's multiplication by the reciprocal for some inputs
+    a = torch.exp2(torch.rand(1 << 20, generator=g, device="cuda") * 20 - 10)
+    ref = (a.cpu().numpy() / np.float32(6.0)).astype(np.float32)
+    report("fdiv(a, 6) == numpy float32 division (IEEE); torch's a / 6.0 is a * fp32(1/6)", torch.equal(emu.fdiv(a, 6.0).cpu(), torch.from_numpy(ref)), f"(a / 6.0 differs from IEEE for {int((a / 6.0 != emu.fdiv(a, 6.0)).sum())} of {a.numel()})")
+    # the 'rn' Q rule against a scalar implementation (zero-scale groups included)
+    qn = (torch.randn(2, 3, 512, generator=g, device="cuda") * torch.exp2(torch.rand(2, 3, 512, generator=g, device="cuda") * 8 - 4)).to(torch.bfloat16).float()
+    qn[0, 0, :16] *= 1e-6
+    qn[0, 1, :] = 0.0
+    qn[1, 2, 16:32] *= 3e3
+    for n in (1, 2):
+        rec = emu.quantize_q(qn, f"nvfp4x{n}", 4, False, "rn")
+        bad = 0
+        for b_ in range(2):
+            for r_ in range(3):
+                dense = np.zeros(512)
+                r = qn[b_, r_].cpu().numpy().astype(np.float32)
+                for _ in range(n):
+                    nr = r.copy()
+                    for g_ in range(32):
+                        codes, sc = slow_nv_group(r[16 * g_:16 * g_ + 16], "rn", False)
+                        for k_ in range(16):
+                            dense[16 * g_ + k_] += codes[k_] * sc
+                            nr[16 * g_ + k_] = np.float32(float(r[16 * g_ + k_]) - codes[k_] * sc)
+                    r = nr
+                bad += not np.array_equal(rec.dense()[b_, r_].cpu().numpy(), dense)
+        report(f"quantize_q nvfp4x{n} rule rn (FlashInfer) == scalar implementation", bad == 0, f"({bad} of 6 rows differ)")
+
+    # (2) P quantization: kperm from the fragment layout, G, bf16 pre-rounding, rules, 4/6, mxfp4
+    kp = slow_kperm_blocks()
+    closed = [[tk for tk in range(64) if (tk // 32) * 2 + (tk % 8) // 4 == b] for b in range(4)]
+    perm0 = emu.kperm_index(64, "cuda").cpu().tolist()
+    report("kperm_index blocks == the blocks derived from the S accumulator / A fragment layouts", kp == closed and [sorted(perm0[16 * b:16 * b + 16]) for b in range(4)] == kp and sorted(perm0) == list(range(64)))
+    bs_, h_, N_ = 2, 3, 128
+    lg = torch.randn(bs_, h_, N_, generator=g, device="cuda") * 3
+    Pm = torch.exp2((lg - lg.amax(-1, keepdim=True)).clamp_min(-30) + torch.rand(bs_, h_, N_, generator=g, device="cuda") * 6)       # numerators in (0, 64]
+    Pm[0, 0, 10] = 0.0
+    Pm[1, 1, 64:96] = 0.0
+    cfgs = []
+    for m in ("lazy", "eager"):
+        for l1 in ("none", "sa3"):
+            for rule in ("ceil", "rn"):
+                for fs in (False, True):
+                    for grp in ("kperm", "contig"):
+                        cfgs.append(emu.Mode(p="nvfp4", p_l1=l1, p_rule=rule, p46=fs, p_group=grp, p_pre="bf16" if (l1 == "sa3") == fs else "f32", m=m, B=64))
+    cfgs.append(emu.Mode(p="mxfp4", B=64))
+    cfgs.append(emu.Mode(p="mxfp4", p_pre="bf16", B=64))
+    bad_cfg = []
+    for mode in cfgs:
+        pc, psf, Gp, perm = emu.quantize_p_fp4(Pm, mode)
+        gg = 16 if mode.p == "nvfp4" else 32
+        deq = pc.double() * psf.double().repeat_interleave(gg, dim=-1)
+        if perm is not None:
+            nat = torch.zeros_like(deq)
+            nat[..., perm] = deq
+            deq = nat
+        got = deq.cpu().numpy()
+        bad = 0
+        for b_ in range(bs_):
+            for r_ in range(h_):
+                for j in range(N_ // 64):
+                    want, Gs = slow_p_block(Pm[b_, r_, 64 * j:64 * j + 64].cpu().numpy(), mode)
+                    bad += not (np.array_equal(got[b_, r_, 64 * j:64 * j + 64], want) and Gs == Gp)
+        if bad:
+            bad_cfg.append((mode.m, mode.p, mode.p_l1, mode.p_rule, mode.p46, mode.p_group, mode.p_pre, bad))
+    report("quantize_p_fp4 == scalar implementation (nvfp4: G, bf16 pre-rounding, ceil / rn, 4/6, kperm / contig; mxfp4)", not bad_cfg, f"({len(cfgs)} configs x 6 rows x 2 blocks; failing: {bad_cfg[:3]})")
+
+    # (3) one fp32 rounding per 64-token instruction: crafted codes where the exact sum (rounded once) differs from a sequential fp32 sum
+    nb = 3
+    pc = torch.ones(1, 2, 64 * nb, device="cuda")                                   # P code 1 everywhere
+    psf = torch.ones(1, 2, 4 * nb, device="cuda")
+    vc = torch.zeros(1, 64 * nb, 512, device="cuda")
+    vsf = torch.ones(1, 4 * nb, 512, device="cuda")
+    for j in range(nb):
+        vc[0, 64 * j, :] = 4.0                                                      # one product 4 * 2^(18 + j) = 2^(20 + j) (alone in its group of 16 tokens)
+        vc[0, 64 * j + 16:64 * j + 64, :] = 1.0                                     # 48 products 2^-9: their exact sum 0.094 is above half an ulp (0.0625) of 2^20, each single one is lost in a sequential sum
+        vsf[0, 4 * j, :] = 2.0 ** (18 + j)
+        vsf[0, 4 * j + 1:4 * j + 4, :] = 2.0 ** -9
+    psf[0, 0, :] = torch.exp2(torch.randint(-1, 2, (4 * nb,), generator=g, device="cuda").float())
+    ls = torch.zeros(1, 2, nb, device="cuda")
+    s_blk = torch.ones(1, 2, nb, device="cuda")
+    s_blk[0, 1, 1] = 0.5
+    O, _ = emu.pv_fp4_core(pc, psf, vc, vsf, 16, ls, s_blk, None)
+    from fractions import Fraction
+    want = np.zeros(2, dtype=np.float32)
+    seq0 = np.float32(0.0)
+    for hh in range(2):
+        acc = np.float32(0.0)
+        for j in range(nb):
+            tot = Fraction(0)
+            for k in range(64):
+                gi = (64 * j + k) // 16
+                tot += Fraction(float(pc[0, hh, 64 * j + k])) * Fraction(float(psf[0, hh, gi])) * Fraction(float(vc[0, 64 * j + k, 0])) * Fraction(float(vsf[0, gi, 0]))
+                if hh == 1 and j == 0:
+                    seq0 = np.float32(seq0 + np.float32(float(pc[0, hh, k]) * float(psf[0, hh, gi]) * float(vc[0, k, 0]) * float(vsf[0, gi, 0])))
+            acc = np.float32(acc * np.float32(s_blk[0, hh, j].item()))
+            acc = np.float32(acc + np.float32(float(tot)))                          # float(Fraction): the correctly rounded double, then float32 (the sums here are exact in double)
+        want[hh] = acc
+    got = O[0].cpu().numpy()
+    report("pv_fp4_core: one fp32 rounding of the exact sum per 64-token instruction == exact Fraction reference", np.array_equal(got, np.broadcast_to(want[:, None], (2, 512))), f"(got {got[:, 0].tolist()}, want {want.tolist()})")
+    exact0 = np.float32(2.0 ** 20 + 48 * 2.0 ** -9)
+    report("  the crafted block tells the exact sum from a sequential fp32 sum (so the test can fail)", float(seq0) == 2.0 ** 20 and float(exact0) != float(seq0), f"(sequential {float(seq0)}, exact-then-round {float(exact0)})")
+
+    # (4) the full pipeline against the scalar implementation; also the dequantized V' and the first-level multiplier
+    OMf = emu.OperandMode
+    ok_modes = []
+
+    def nv_om(qn, k="nvf4r", **kw):
+        return OMf(qn, k, "nvf4t", **kw)
+
+    fi_k = nv_om("nvfp4x1", k_rule="rn", v_rule="rn")
+    fi = emu.Mode(fp8=fi_k, mxfp4=fi_k, fp4=nv_om("nvfp4x1", "native", v_rule="rn"), p="nvfp4", p_rule="rn", p_group="contig", p_pre="bf16", m="eager", B=64, accum="f32seg", q_rule="rn")
+    mine = emu.Mode(fp8=nv_om("nvfp4x2", v_l1="grp"), mxfp4=nv_om("nvfp4x2", v_l1="grp"), fp4=nv_om("nvfp4x2", "native", v_l1="grp"), p="nvfp4", p_l1="sa3", p_rule="ceil", m="lazy", B=64, accum="f32seg",
+                    q_rule="ceil")
+    mine46 = emu.Mode(fp8=nv_om("nvfp4x1", k_rule="rn", v_l1="grp", v_rule="rn", v46=True), mxfp4=nv_om("nvfp4x1", k_rule="rn", v_l1="grp", v_rule="rn", v46=True),
+                      fp4=nv_om("nvfp4x1", "native", v_l1="grp", v_rule="rn", v46=True), p="nvfp4", p_l1="sa3", p_rule="rn", p46=True, m="eager", B=64, accum="f64", q_rule="rn")
+    f8m = emu.Mode(fp8=OMf("mxfp8x2", "native", "nvf4t", v_l1="grp"), mxfp4=OMf("mxfp8x1", "native", "nvf4t", v_l1="grp"), fp4=nv_om("nvfp4x2", "native", v_l1="grp"), p="nvfp4", p_l1="sa3", p_rule="ceil",
+                   m="final", B=64, accum="f32seg", q_rule="ceil")
+    mx4 = emu.Mode(mxfp4=OMf("mxfp4x4", "native", "mxf4r"), fp8=OMf("mxfp8x1", "native", "nvf4t"), p="mxfp4", m="eager", B=64, accum="f64", q_kernel_rule=True)
+    smooth = emu.Mode(fp8=nv_om("nvfp4x2", k_rule="rn", v_rule="rn", v_smooth=32, k_smooth=32), fp4=nv_om("nvfp4x2", "native", v_rule="rn", v_smooth=32), mxfp4=nv_om("nvfp4x2", k_rule="rn", v_rule="rn", v_smooth=32, k_smooth=32),
+                      p="nvfp4", p_l1="sa3", p_rule="rn", m="eager", B=64, accum="f64", q_rule="rn", q_smooth=True)
+    cases = [("fp8+fp4", "fi-dsv4-nvfp4 (Q rn x1, K nvf4r rn, P rn contig bf16 eager, V^T rn)", fi),
+             ("fp8+fp4", "sa3 ceil kperm lazy, Q x2, V grp ceil, f32seg", mine),
+             ("fp8+fp4", "sa3 rn 4/6 on P and V, eager, Q x1 rn, V grp", mine46),
+             ("fp8+fp4", "FP8 tile Q mxfp8x2 native QK (f8m), P ceil sa3 final", f8m),
+             ("mxfp4", "MXFP4 cache mxfp4x4 Q native + P mxfp4 + V mxf4r, eager", mx4),
+             ("fp8+fp8", "fi-dsv4-nvfp4 on two FP8 caches", fi),
+             ("mxfp4", "fi-dsv4-nvfp4 on the MXFP4 cache (K requantized)", fi),
+             ("fp8+fp4", "smoothing of Q, K, V (tile 32)", smooth)]
+    for cls in ("hv4", "kampw4"):
+        for family, label, mode in cases:
+            if cls == "kampw4" and family != "fp8+fp4":
+                continue
+            with upstream_defaults():
+                main, extra = FAMILIES[family]
+                cfg = CLASSES[cls]
+                raw = lib.RawTestParamForDecode(b=2, h_q=4, s_q=1, h_kv=1, s_kv=512, is_varlen=True, topk=96, have_topk_length=True, enable_attn_sink=True,
+                                                extra_s_k=512 if extra else None, extra_topk=80 if extra else None, block_size=64, extra_block_size=64 if extra else None,
+                                                have_extra_topk_length=bool(extra), d_qk=512, kvcache_layout=main, extra_kvcache_layout=extra, num_runs=0, seed=77)
+                p = raw.to_test_param()
+                tt = lib.generate_testcase_for_decode(p)
+                if cfg["kamp"]:
+                    apply_k_gain(tt, 5, cfg.get("kamp_spread", 6.0))
+                tt.sm_scale *= cfg["sigma"] / logit_std(tt)
+                if tt.attn_sink is not None:
+                    tt.attn_sink[0], tt.attn_sink[1], tt.attn_sink[2], tt.attn_sink[3] = 0.3, float("inf"), float("-inf"), -0.5
+            with torch.inference_mode():
+                out, lse = emu.simulate_decode(p, tt, mode)
+            worst_ulp, worst_lse, vbad = 0.0, 0.0, 0
+            for bi in range(2):
+                parts = {}
+                so, sl = slow_decode_token_fp4(tt, mode, bi, 0, parts)
+                o = out[bi, 0].float().cpu()
+                so = so.float()
+                nz = (so != 0) | (o != 0)
+                rel = ((o - so).abs() / (so.abs().clamp_min(1e-30)))[nz]
+                worst_ulp = max(worst_ulp, float(rel.max()) / 2.0 ** -7 if rel.numel() else 0.0)
+                lf = lse[bi, :, 0].cpu()
+                fin = torch.isfinite(sl) & torch.isfinite(lf)
+                worst_lse = max(worst_lse, float((lf[fin] - sl[fin]).abs().max()) if fin.any() else 0.0)
+                assert torch.equal(torch.isinf(lf), torch.isinf(sl))
+                if bi == 0:
+                    # dequantized V' of the vectorized code (natural token order) against the scalar one
+                    sds = [emu.gather_scope(s_, 2, 1) for s_ in ([tt.kv_scope] + ([tt.extra_kv_scope] if tt.extra_kv_scope is not None else []))]
+                    codes_, sfv_, col_, vbar_ = emu.v_fp4_terms(sds, [mode.ops(sd.layout) for sd in sds], mode)
+                    gg = 16 if mode.p == "nvfp4" else 32
+                    deq = (codes_.double() * sfv_.double().repeat_interleave(gg, dim=1))
+                    if mode.p == "nvfp4" and mode.p_group == "kperm":
+                        perm = emu.kperm_index(deq.shape[1], deq.device)
+                        nat = torch.zeros_like(deq)
+                        nat[:, perm] = deq
+                        deq = nat
+                    vbad = int((deq[0].cpu().numpy() != parts["vdeq"]).sum()) + int((col_[0].cpu().numpy() != parts["col"]).sum())
+            report(f"vectorized == scalar implementation [{cls} {family} {label}]", worst_ulp <= 1.01 and worst_lse < 5e-5 and vbad == 0,
+                   f"(max out diff {worst_ulp:.2f} bf16 ulp, max lse diff {worst_lse:.1e}, dequantized V' differs in {vbad} elements)")
+    return ok
+
+
 def selftest_framework(verbose: bool = True) -> bool:
     """The vectorized emulator == the slow independent implementation, on small cases that exercise lazy max updates, empty blocks, the fp4 conversions, rebase"""
     ok = True
@@ -1053,6 +1580,7 @@ def selftest_framework(verbose: bool = True) -> bool:
                 worst_lse = max(worst_lse, float((lf[fin] - sl[fin]).abs().max()) if fin.any() else 0.0)
                 assert torch.equal(torch.isinf(lf), torch.isinf(sl))
             report(f"vectorized == slow independent implementation [{cls} {family} {label}]", worst_ulp <= 1.01 and worst_lse < 5e-5, f"(max out diff {worst_ulp:.2f} bf16 ulp, max lse diff {worst_lse:.1e})")
+    ok &= selftest_fp4()
     print("ALL PASS" if ok else "SOME CHECKS FAILED")
     return ok
 
@@ -1070,10 +1598,15 @@ def main():
     ap.add_argument("--md", default=None)
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--selftest", action="store_true", help="Check the emulator against an independent slow implementation")
+    ap.add_argument("--selftest-fp4", action="store_true", help="Only the FP4 PV part of --selftest (nvfp4 / mxfp4 P, V^T, K requantization, FlashInfer reference row)")
     ap.add_argument("--check-exact", action="store_true", help="Run only the exact combination; exit 1 if it fails the upstream tolerances anywhere")
     args = ap.parse_args()
 
     combos = build_combos()
+    if args.selftest_fp4:
+        ok = selftest_fp4()
+        print("ALL PASS" if ok else "SOME CHECKS FAILED")
+        sys.exit(0 if ok else 1)
     if args.selftest:
         sys.exit(0 if selftest_framework() else 1)
     if args.list:
