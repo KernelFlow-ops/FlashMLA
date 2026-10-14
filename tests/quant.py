@@ -8,7 +8,7 @@ import kernelkit as kk
 class KVCacheLayout(enum.Enum):
     V41_FP8Sparse = 0
     V41_FP4Sparse = 1
-    V41_MXFP4Sparse = 2     # OCP MX-style fp4: e2m1 data + one ue8m0 (power of two) scale per 32 elements; 272 B/token. Only has a Python reference, no kernel parses it yet
+    V41_MXFP4Sparse = 2     # OCP MX-style fp4: e2m1 data + one ue8m0 (power of two) scale per 32 elements; 272 B/token. Read by the sm120 decode kernel only (csrc/cuda_kernels/sm120/decode/sparse/mxfp4.cu)
 
     def get_meta(self) -> Tuple[int, int, int, int, int]:
         # Return: (d, d_nope, d_rope, tile_size, num_tiles)

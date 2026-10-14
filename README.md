@@ -96,6 +96,8 @@ git submodule update --init --recursive
 pip install -v . --no-build-isolation
 ```
 
+For RTX 50 series / RTX PRO Blackwell GPUs (sm120), build with `FLASH_MLA_CUDA_ARCHS=sm_120a`; only the DeepSeek-V4.1 sparse decoding kernel is available there, with selectable precision modes and an optional MXFP4 KV cache. See [docs/sm120/README.md](docs/sm120/README.md).
+
 `--no-build-isolation` is required: `setup.py` imports `torch` (and `torch_npu` on the Ascend platform) while building, and this repository does not declare them as PEP 518 build requirements.
 
 The build target platform is detected automatically (`/dev/davinci_manager` means Ascend, anything else means CUDA) and can be overridden with `FLASH_MLA_BUILD_TARGET_PLATFORM=CUDA` or `FLASH_MLA_BUILD_TARGET_PLATFORM=ASCEND`.

@@ -77,8 +77,9 @@ does the same for two eager runs.
 * `eager` calls `lib.run_flash_mla_decode`, i.e. it includes the test wrapper's Python (slicing, argument building) and the
   `torch.empty` of the outputs. One eager call costs about 37 us of CPU time on the RTX 5090 test machine (the topk 2048 shapes at b 1 / 4,
   whose GPU time is shorter, are CPU-bound at 37.5 us per layer; it varies with the load of the host). When the GPU time of a
-  call is longer than that (all production shapes, and the 128 + 512 small-batch shapes, which take 73 us) the launches are
-  hidden and eager equals graph within 1-2%; the graph wins by 18-27% only for the short split-KV calls (b 1 / 4, topk 2048).
+  call is longer than that (all production shapes) the launches are hidden and eager equals graph within 1-2%. Shorter calls are
+  CPU-bound in eager: the small-batch shapes, which are split over the SMs on sm120 (15 to 56 us of GPU time, 43 to 46 us per eager
+  call with the scheduler and combine launches), run 1.3 to 3x faster in the graph, and the topk 2048 shapes at b 1 / 4 18-27% faster.
 * `--nvtx` wraps every layer (and every replay) in an nvtx range for nsys. Under a profiler the kineto step is skipped
   (CUPTI is taken); `nsys profile -t cuda,nvtx --cuda-graph-trace=node python ... --only h64_b64_fp8 --nvtx --no-kineto`
   lists the kernels of the graph nodes.
