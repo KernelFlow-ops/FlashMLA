@@ -47,7 +47,10 @@ EMU_ROW = "p3-mxfp8-nvq2s"      # the emulator row of the fp4 tile of mxfp8.cu: 
 OUT_TOL = dict(abs_tol=1e-3, rel_tol=2.01 / 128, cos_diff_tol=5e-6)
 LSE_TOL = dict(abs_tol=1e-6, rel_tol=8.01 / 65536)
 # The mxfp8 tier: against the emulator row (the kernel differs from it only by the order of the fp32 additions inside the MMAs), and against the reference
-EMU_COS_TOL = 1e-7              # kernel vs emulator
+# kernel vs emulator: the only difference is the order of the fp32 additions inside the MMAs, which rarely moves a P value across a rounding boundary of
+# e4m3; one such flip in a request with few valid tokens changes its 512 outputs by a few percent (cos_diff up to 7e-7 measured over 860 cases, the median
+# is 2e-10). The mode's own error against the reference is 4e-4, so this bound still separates a real difference by two orders of magnitude.
+EMU_COS_TOL = 2e-6
 EMU_SAME_BF16 = 0.999           # fraction of bit-identical bf16 outputs, no split request, h_q = 128
 MXFP8_REF_COS_TOL = 2e-3        # kernel vs reference (the upstream data with an fp4 extra cache: about 3.4e-4)
 MXFP8_REF_LSE_TOL = 1e-2
