@@ -25,8 +25,8 @@ NUM_TERMS = 1 (EXTRA_FP4, below), and the main cache may be the V4.1 fp4 cache t
   power-of-two scale per tile and 32 dims, which makes it a rebased tile like the others; the scale
   comes from the largest 16-dim scale of the tile (rebase_fp4_tile_part).
 - MAIN_FP4 (together with EXTRA_FP4, NUM_TERMS = 1): the main cache is a V4.1 fp4 cache, so every tile is an fp4 tile as
-  above: Q is quantized once per request, to FP4_Q_TERMS NVFP4 terms only, and all rows, of the main and of the extra
-  cache, come with one cp.async.bulk each (a 288 B row has no gather4 tensor map).
+  above: Q is quantized once per request, to FP4_Q_TERMS NVFP4 terms only, and the rows of the main and of the extra
+  cache come with a TMA tile::gather4 per 4 rows, each row in a box of FP4_G4_ROW_STRIDE (see fp4_row_offset).
 
 The CTA holds one query token and 64 heads, as in the bf16 path (bf16.cu), and walks tiles of B_TOPK
 tokens with 8 consumer warps and 4 producer warps.
@@ -35,10 +35,10 @@ tokens with 8 consumer warps and 4 producer warps.
   compute S over half of the dims, swap the halves through shared memory, run the same softmax, and keep
   P in registers as the A fragments of PV, each over half of the output columns.
 - Producer warp 0 gathers into a ring of NUM_RAW_BUFS tiles, as far ahead as the ring is free. Rows of an
-  fp8 cache come with one TMA tile::gather4 per 4 rows, from a tensor map of the cache built on the
-  host; rows of an fp4 cache (and of an fp8 cache whose block stride is not a whole number of rows)
-  with one cp.async.bulk per row. Bulk copies are serialized at about 90 clock cycles each whatever
-  their size, so a tile of them keeps the warp busy; a gather4 costs about as much for 4 rows. The row
+  fp8 cache, and of an fp4 main cache, come with one TMA tile::gather4 per 4 rows, from a tensor map of the cache
+  built on the host; rows of the fp4 extra cache of an fp8 main cache (and of a cache whose block stride is not a
+  whole number of rows) with one cp.async.bulk per row. Bulk copies are serialized at about 90 clock cycles each
+  whatever their size, so a tile of them keeps the warp busy; a gather4 costs about as much for 4 rows. The row
   indices are loaded one tile before they are used to keep that load off the path.
 - The other three producer warps rebase every tile as soon as it has arrived, into one of two V
   buffers, so that the rebase of a tile does not wait for the PV of the tile before it.
@@ -74,10 +74,16 @@ static constexpr int GROUP_ROWS = 4;
 static constexpr int GROUP_STRIDE = 2176;
 static constexpr int GROUP_GAP = GROUP_ROWS * ROW_BYTES;  // Where the free 64 B of a group start
 static constexpr int RAW_BUF_BYTES = B_TOPK / GROUP_ROWS * GROUP_STRIDE;
-// The rows of an fp4 tile (288 B) go to the same groups at this stride, with the odd groups 64 B further: an
-// ldmatrix reads the 8 rows of two groups, which then fall on 8 different 16 B bank positions
+// The rows of an fp4 tile (288 B) go to the same groups, in two layouts (see fp4_row_offset). In both an ldmatrix, which
+// reads the 8 rows of two groups, finds them at 8 different 16 B bank positions.
+// - The fp4 extra cache of an fp8 main cache, rows copied one by one: row stride FP4_ROW_STRIDE, the odd groups 64 B further.
+// - MAIN_FP4: a gather4 writes a box of FP4_G4_ROW_STRIDE per row (88 columns of 4 B: the row, then zeros), the 4 rows of a
+//   group one after another (1408 B = 11 * 128, so that the next group is 128 B aligned again). The odd groups start the
+//   box at column -4, which puts 16 B of zeros before the row and moves the row by 16 B. Rows of a cache that the gather4
+//   cannot take are copied one by one to the same places.
 static constexpr int FP4_ROW_BYTES = Fp4Format::BYTES_PER_TOKEN;
 static constexpr int FP4_ROW_STRIDE = FP4_ROW_BYTES + 16;
+static constexpr int FP4_G4_ROW_STRIDE = 352;
 // Q of an fp4 tile = the sum of this many e2m1 terms
 #ifndef MLA_SM120_FP4_Q_TERMS
 #define MLA_SM120_FP4_Q_TERMS 2
@@ -91,6 +97,8 @@ static constexpr uint32_t PAIR_BARRIER_BASE = 3;
 
 static_assert(GROUP_STRIDE % 128 == 0 && GROUP_STRIDE - GROUP_GAP == 64);
 static_assert(64 + (GROUP_ROWS - 1) * FP4_ROW_STRIDE + FP4_ROW_BYTES <= GROUP_GAP && FP4_ROW_STRIDE % 32 == 16);
+static_assert(GROUP_ROWS * FP4_G4_ROW_STRIDE % 128 == 0 && FP4_G4_ROW_STRIDE % 128 == 96 && FP4_G4_ROW_STRIDE >= FP4_ROW_BYTES + 16 + 16);
+static_assert(GROUP_ROWS * FP4_G4_ROW_STRIDE <= GROUP_GAP, "a gather4 box must not reach the state in the gap of a group");
 static_assert(Fp8Format::QUANT_BYTES == D_QK && Fp8Format::QUANT_TILE_SIZE == 32);
 static_assert(Fp4Format::QUANT_BYTES == D_QK / 2 && Fp4Format::QUANT_TILE_SIZE == 16);
 
@@ -120,14 +128,16 @@ __device__ __forceinline__ RingState &ring_state(SharedMemoryPlan &plan) { retur
 __device__ __forceinline__ TileState &tile_state(SharedMemoryPlan &plan) { return *reinterpret_cast<TileState*>(plan.raw[0] + GROUP_STRIDE + GROUP_GAP); }
 __device__ __forceinline__ ScaleState &scale_state(SharedMemoryPlan &plan) { return *reinterpret_cast<ScaleState*>(plan.raw[0] + 2 * GROUP_STRIDE + GROUP_GAP); }
 
-// Where row r of a raw tile starts: fp8 rows, and fp4 rows
+// Where row r of a raw tile starts: fp8 rows, and fp4 rows (G4: the layout of MAIN_FP4)
 __device__ __forceinline__ int raw_row_offset(int r) {
     return (r / GROUP_ROWS) * GROUP_STRIDE + (r % GROUP_ROWS) * ROW_BYTES;
 }
+template<bool G4>
 __device__ __forceinline__ int fp4_row_offset(int r) {
-    return (r / GROUP_ROWS) * GROUP_STRIDE + (r / GROUP_ROWS % 2) * 64 + (r % GROUP_ROWS) * FP4_ROW_STRIDE;
+    return G4 ? (r / GROUP_ROWS) * GROUP_STRIDE + (r / GROUP_ROWS % 2) * 16 + (r % GROUP_ROWS) * FP4_G4_ROW_STRIDE
+              : (r / GROUP_ROWS) * GROUP_STRIDE + (r / GROUP_ROWS % 2) * 64 + (r % GROUP_ROWS) * FP4_ROW_STRIDE;
 }
-// Rows 8n + r are 2n groups further than row r, in both layouts
+// Rows 8n + r are 2n groups further than row r, in all layouts
 static constexpr int EIGHT_ROWS = 2 * GROUP_STRIDE;
 
 // Two layouts of a V buffer, both with the 16 B chunks XOR-swizzled by row % 8, so that 8 consecutive rows put the
@@ -221,8 +231,8 @@ __device__ __forceinline__ void gather_tile(
     const uint32_t idx_in_page = (uint32_t)index - page_idx * page_block_size;
     const int rows_per_block = is_extra_block ? maps.extra_rows_per_block : maps.kv_rows_per_block;
     uint32_t num_bytes;
-    if (!is_fp4 && rows_per_block > 0) {
-        // Lane g < 8 gathers the group of tokens [4g, +4)
+    if ((MAIN_FP4 || !is_fp4) && rows_per_block > 0) {
+        // Lane g < 8 gathers the group of tokens [4g, +4); with MAIN_FP4 the odd groups from column -4 on
         const int row = is_token_valid ? (int)(page_idx * rows_per_block + idx_in_page) : -1;
         const int group = lane_idx % 8;
         const int r0 = __shfl_sync(0xffffffffu, row, 4 * group), r1 = __shfl_sync(0xffffffffu, row, 4 * group + 1);
@@ -231,15 +241,15 @@ __device__ __forceinline__ void gather_tile(
         uint32_t valid_groups = valid_mask | (valid_mask >> 1);
         valid_groups = (valid_groups | (valid_groups >> 2)) & 0x11111111u;
         if (lane_idx < 8 && ((valid_groups >> (4 * group)) & 1)) {
-            tma_gather4(plan.raw[raw_idx] + group * GROUP_STRIDE, is_extra_block ? &maps.extra_kv : &maps.kv, 0, r0, r1, r2, r3, bar);
+            tma_gather4(plan.raw[raw_idx] + group * GROUP_STRIDE, is_extra_block ? &maps.extra_kv : &maps.kv, MAIN_FP4 ? -4 * (group % 2) : 0, r0, r1, r2, r3, bar);
         }
-        num_bytes = __popc(valid_groups) * (GROUP_ROWS * ROW_BYTES);
+        num_bytes = __popc(valid_groups) * (MAIN_FP4 ? GROUP_ROWS * FP4_G4_ROW_STRIDE : GROUP_ROWS * ROW_BYTES);
     } else {
         if (is_token_valid) {
             const int64_t block_stride = is_extra_block ? params.stride_extra_kv_block : params.stride_kv_block;
             const uint8_t *cache = reinterpret_cast<const uint8_t*>(is_extra_block ? params.extra_kv : params.kv);
             bulk_copy_g2s(
-                plan.raw[raw_idx] + (is_fp4 ? fp4_row_offset(lane_idx) : raw_row_offset(lane_idx)),
+                plan.raw[raw_idx] + (is_fp4 ? fp4_row_offset<MAIN_FP4>(lane_idx) : raw_row_offset(lane_idx)),
                 cache + page_idx * block_stride + (int64_t)idx_in_page * row_bytes,
                 row_bytes,
                 bar
@@ -314,17 +324,17 @@ __device__ __forceinline__ void rebase_tile_part(SharedMemoryPlan &plan, uint32_
     }
 }
 
-// The same for a tile of the fp4 cache (rows at fp4_row_offset), whose values are e2m1 times an e4m3 scale per 16 dims:
+// The same for a tile of the fp4 cache (rows at fp4_row_offset<G4>), whose values are e2m1 times an e4m3 scale per 16 dims:
 // per 32-dim group the scale of the tile is the smallest power of two 2^E with amax / 2^E <= 448, and every value is
 // rounded once to e4m3 on it. amax is 6 (the largest e2m1 magnitude) times the largest scale of the valid tokens: a
 // bound of their magnitudes that the cache writer reaches unless that scale is clamped or subnormal, and one integer
 // max per group instead of a search of the codes of every token. The product e2m1 * (scale / 2^E) is exact in fp16
 // down to where e4m3 rounds it to zero anyway.
-template<bool PAIRED_V>
+template<bool PAIRED_V, bool G4>
 __device__ __forceinline__ void rebase_fp4_tile_part(SharedMemoryPlan &plan, uint32_t raw_idx, uint32_t v_idx, uint32_t tile_idx, int group_begin, int group_end) {
     const int lane_idx = threadIdx.x % 32;
     const bool is_token_valid = (tile_state(plan).valid_mask[tile_idx % NUM_MASK_BUFS] >> lane_idx) & 1;
-    const uint8_t *row = plan.raw[raw_idx] + fp4_row_offset(lane_idx);
+    const uint8_t *row = plan.raw[raw_idx] + fp4_row_offset<G4>(lane_idx);
     const int v_row = v_row_of_token(lane_idx);
     uint8_t *dst = plan.v[v_idx];
     const uint32_t out_mask = is_token_valid ? 0xffffffffu : 0u;
@@ -442,7 +452,7 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
                 mbarrier_wait(&ring_state(plan).bar_v_free[v_idx], ((tile_idx / NUM_V_BUFS) & 1) ^ 1);
             }
             if (MAIN_FP4 || (EXTRA_FP4 && tile_state(plan).is_fp4_tile[tile_idx % NUM_MASK_BUFS])) {
-                rebase_fp4_tile_part<PAIRED_V>(plan, raw_idx, v_idx, tile_idx, group_begin, group_end);
+                rebase_fp4_tile_part<PAIRED_V, MAIN_FP4>(plan, raw_idx, v_idx, tile_idx, group_begin, group_end);
             } else {
                 rebase_tile_part<PAIRED_V>(plan, raw_idx, v_idx, tile_idx, group_begin, group_end);
             }
@@ -666,15 +676,15 @@ __device__ __forceinline__ void qk_tile_fp8(const uint8_t *raw, float (&s_acc)[4
     }
 }
 
-// The same for a tile of the fp4 cache: rows at fp4_row_offset, 128 B of e2m1 and 16 B of scales per half of the dims
-template<int NQ>
+// The same for a tile of the fp4 cache: rows at fp4_row_offset<G4>, 128 B of e2m1 and 16 B of scales per half of the dims
+template<int NQ, bool G4>
 __device__ __forceinline__ void qk_tile_fp4(const uint8_t *raw, float (&s_acc)[4][4], const uint32_t (&q_frag)[NQ][4][4], const uint32_t (&q_scale)[NQ][2]) {
     const int lane_idx = threadIdx.x % 32;
     const int q_half = threadIdx.x / 32 % 2;
     const int g = lane_idx / 4, t = lane_idx % 4;
     // Thread t of a quad: the scales of MMA t (dims [64t, +64) of this half) of its token
-    const uint32_t *k_scales = reinterpret_cast<const uint32_t*>(raw + fp4_row_offset(g) + Fp4Format::QUANT_BYTES + 16 * q_half + 4 * t);
-    const uint32_t base = smem_addr(raw) + fp4_row_offset(lane_idx % 8) + (lane_idx / 8) * 16 + q_half * (D_QK / 4);
+    const uint32_t *k_scales = reinterpret_cast<const uint32_t*>(raw + fp4_row_offset<G4>(g) + Fp4Format::QUANT_BYTES + 16 * q_half + 4 * t);
+    const uint32_t base = smem_addr(raw) + fp4_row_offset<G4>(lane_idx % 8) + (lane_idx / 8) * 16 + q_half * (D_QK / 4);
     #pragma unroll
     for (int half = 0; half < 2; ++half) {
         #pragma unroll
@@ -850,8 +860,9 @@ __device__ __forceinline__ void start_request(float (&o_acc)[NUM_OUT_TILES][4], 
     li[0] = li[1] = 0.0f;
 }
 
-// One tile of the main cache (QK_FP4 = false) or of the fp4 extra cache, for the consumer warps
-template<int NUM_TERMS, bool QK_FP4, typename QFrag, typename QScale>
+// One tile of the main cache (QK_FP4 = false) or of the fp4 extra cache, for the consumer warps. FP4_G4: the rows of the
+// fp4 tile are laid out for the gather4 (MAIN_FP4)
+template<int NUM_TERMS, bool QK_FP4, bool FP4_G4, typename QFrag, typename QScale>
 __device__ __forceinline__ void consume_tile(
     const SparseAttnDecodeParams &params, SharedMemoryPlan &plan, uint32_t tile_idx, const QFrag &q_frag, const QScale &q_scale,
     float (&o_acc)[NUM_OUT_TILES][4], float (&mi)[2], float (&li)[2]
@@ -868,7 +879,7 @@ __device__ __forceinline__ void consume_tile(
         s_acc[n][0] = s_acc[n][1] = s_acc[n][2] = s_acc[n][3] = 0.0f;
     }
     if constexpr (QK_FP4) {
-        qk_tile_fp4<FP4_Q_TERMS>(plan.raw[buf_idx], s_acc, q_frag, q_scale);
+        qk_tile_fp4<FP4_Q_TERMS, FP4_G4>(plan.raw[buf_idx], s_acc, q_frag, q_scale);
     } else {
         qk_tile_fp8<NUM_TERMS>(plan.raw[buf_idx], s_acc, q_frag, q_scale);
     }
@@ -984,7 +995,7 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
                 start_request(o_acc, mi, li);
                 #pragma unroll 1
                 for (; block_idx < end_block_idx; ++block_idx, ++tile_idx) {
-                    consume_tile<NUM_TERMS, true>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
+                    consume_tile<NUM_TERMS, true, true>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
                 }
             } else {
                 start_request(o_acc, mi, li);
@@ -996,7 +1007,7 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
             start_request(o_acc, mi, li);
             #pragma unroll 1
             for (; block_idx < end_block_idx; ++block_idx, ++tile_idx) {
-                consume_tile<NUM_TERMS, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
+                consume_tile<NUM_TERMS, false, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
             }
         } else {
             if (block_idx < fp8_end_block_idx) {
@@ -1005,7 +1016,7 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
                 start_request(o_acc, mi, li);
                 #pragma unroll 1
                 for (; block_idx < fp8_end_block_idx; ++block_idx, ++tile_idx) {
-                    consume_tile<NUM_TERMS, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
+                    consume_tile<NUM_TERMS, false, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
                 }
             } else {
                 start_request(o_acc, mi, li);
@@ -1016,7 +1027,7 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
                 quantize_q_nvfp4<FP4_Q_TERMS>(q_row(params, batch_idx), 8 * (int64_t)params.stride_q_h_q, q_frag, q_scale);
                 #pragma unroll 1
                 for (; block_idx < end_block_idx; ++block_idx, ++tile_idx) {
-                    consume_tile<NUM_TERMS, true>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
+                    consume_tile<NUM_TERMS, true, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
                 }
             }
         }
@@ -1064,14 +1075,20 @@ static void launch(const SparseAttnDecodeParams &params) {
     static_assert(!MAIN_FP4 || (EXTRA_FP4 && NUM_TERMS == 1));
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
 
-    // The rows of an fp4 cache have no tensor map (rows_per_block stays 0): they are copied one by one
+    // The rows of the fp4 extra cache of an fp8 main cache have no tensor map (rows_per_block stays 0): they are copied one by
+    // one. With MAIN_FP4 both caches have one, a box of FP4_G4_ROW_STRIDE (the row, then zeros; from column -4, zeros and the row).
     GatherMaps maps;
     std::memset(&maps, 0, sizeof(maps));
-    if (!MAIN_FP4) {
+    if (MAIN_FP4) {
+        maps.kv_rows_per_block = make_gather_map(maps.kv, params.kv, params.num_blocks, params.page_block_size, params.stride_kv_block, FP4_ROW_BYTES, FP4_G4_ROW_STRIDE);
+        if (params.extra_topk > 0) {
+            maps.extra_rows_per_block = make_gather_map(maps.extra_kv, params.extra_kv, params.extra_num_blocks, params.extra_page_block_size, params.stride_extra_kv_block, FP4_ROW_BYTES, FP4_G4_ROW_STRIDE);
+        }
+    } else {
         maps.kv_rows_per_block = make_gather_map(maps.kv, params.kv, params.num_blocks, params.page_block_size, params.stride_kv_block, ROW_BYTES, ROW_BYTES);
-    }
-    if (params.extra_topk > 0 && !EXTRA_FP4) {
-        maps.extra_rows_per_block = make_gather_map(maps.extra_kv, params.extra_kv, params.extra_num_blocks, params.extra_page_block_size, params.stride_extra_kv_block, ROW_BYTES, ROW_BYTES);
+        if (params.extra_topk > 0 && !EXTRA_FP4) {
+            maps.extra_rows_per_block = make_gather_map(maps.extra_kv, params.extra_kv, params.extra_num_blocks, params.extra_page_block_size, params.stride_extra_kv_block, ROW_BYTES, ROW_BYTES);
+        }
     }
 
     auto kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<NUM_TERMS, EXTRA_FP4, MAIN_FP4>;
