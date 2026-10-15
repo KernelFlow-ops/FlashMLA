@@ -1,5 +1,7 @@
 # FlashMLA on RTX 50 series / sm120: DeepSeek-V4.1 sparse decoding
 
+> An illustrated overview of this work (background, results, design, figures) is the [top-level README](../../README.md); this page is the technical reference.
+
 This branch adds an sm120 (RTX 5090 and the other RTX 50 / RTX PRO Blackwell GPUs) implementation of the
 DeepSeek-V4.1 sparse attention (DSA) decoding kernel, `flash_mla_with_kvcache`. Upstream has no kernel that runs on this architecture:
 its sparse decoding kernels are written for sm100 (tcgen05 / TMEM, which sm120 does not have, and more shared memory than the
@@ -186,7 +188,7 @@ Kineto times in us (decode + combine kernel), 128 + 512 tokens, extra cache FP8.
 | h128, b4, s_q 4 | 16 | 75.0 | 36.7 | 28.9 | 25.8 | 73.3 | 46.6 |
 | h128, b16, s_q 4 | 64 | 82.6 | 83.7 | 54.7 | 39.9 | 263.1 | 245.1 |
 
-From T = 16 on, our exact mode is 2 to 3x faster than FlashInfer's. At T = 1, and at T = 4 with h = 64, FlashInfer's exact mode is still
+From T = 16 on, our exact mode is 1.7 to 3.1x faster than FlashInfer's. At T = 1, and at T = 4 with h = 64, FlashInfer's exact mode is still
 1.1 to 1.4x faster than ours (its default mode is 1.1 to 1.4x faster than our `mxfp8`). About 6 us of our time there is the combine kernel. Under a CUDA Graph (`benchmarks/sm120/bench_decode_graph.py`), the bf16 time per layer of
 h64 b1 s_q 1 goes from 71.8 to 17.8 us, and graph replay equals eager bit for bit for every shape and mode.
 
