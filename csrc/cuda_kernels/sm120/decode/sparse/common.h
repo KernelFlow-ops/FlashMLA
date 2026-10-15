@@ -54,7 +54,8 @@ enum NamedBarriers : uint32_t {
 };
 
 struct Request {
-    int start_block_idx, end_block_idx;     // Tiles [start, end): those of `kv` come first, then those of `extra_kv`
+    int start_block_idx, end_block_idx;     // Tiles [start, end): those of `kv` come first, then those of `extra_kv` (but see
+                                            // is_extra_block_at in mxfp8.cu)
     int num_orig_blocks;
     int topk_length, extra_topk_length;
     int n_split_idx;

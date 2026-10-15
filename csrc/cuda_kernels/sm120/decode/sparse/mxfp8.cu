@@ -178,10 +178,23 @@ struct VStore {
     }
 };
 
+// The blocks of a request are those of `kv`, then those of `extra_kv` (Request), except with an fp4 extra cache next to an fp8
+// main cache (EXTRA_FIRST = EXTRA_FP4 && !MAIN_FP4): there the blocks of the extra cache come first. The consumers quantize Q
+// for the tiles of a cache before the first of them. For fp4 tiles that takes about twice the time of the e4m3 Q of fp8 tiles,
+// and in the middle of a request nothing hides it, while at the start of a request it overlaps the wait for the first tiles.
+template<bool EXTRA_FIRST>
+__device__ __forceinline__ bool is_extra_block_at(int block_idx, int num_orig_blocks, int num_extra_blocks) {
+    return EXTRA_FIRST ? block_idx < num_extra_blocks : block_idx >= num_orig_blocks;
+}
+
+__device__ __forceinline__ int num_extra_blocks_of(const Request &req) {
+    return (req.extra_topk_length + B_TOPK - 1) / B_TOPK;
+}
+
 // The tiles of a CTA in order: the blocks [start, end) of each of its requests
 struct TileCursor {
     int batch_idx, block_idx, end_block_idx;
-    int num_orig_blocks, topk_length, extra_topk_length;
+    int num_orig_blocks, num_extra_blocks, topk_length, extra_topk_length;
 };
 
 __device__ __forceinline__ void enter_request(TileCursor &cursor, const SparseAttnDecodeParams &params, int partition_idx, int batch_idx) {
@@ -190,17 +203,27 @@ __device__ __forceinline__ void enter_request(TileCursor &cursor, const SparseAt
     cursor.block_idx = req.start_block_idx;
     cursor.end_block_idx = req.end_block_idx;
     cursor.num_orig_blocks = req.num_orig_blocks;
+    cursor.num_extra_blocks = num_extra_blocks_of(req);
     cursor.topk_length = req.topk_length;
     cursor.extra_topk_length = req.extra_topk_length;
 }
 
+template<bool EXTRA_FIRST>
+__device__ __forceinline__ bool is_extra_block_at(const TileCursor &cursor) {
+    return is_extra_block_at<EXTRA_FIRST>(cursor.block_idx, cursor.num_orig_blocks, cursor.num_extra_blocks);
+}
+
 // The cache position of each token of the tile under `cursor`, one lane per token; -1 = not a token.
 // A load from global memory that has not been touched before: the gather warp issues it one tile ahead.
+template<bool EXTRA_FIRST>
 __device__ __forceinline__ int load_tile_index(const SparseAttnDecodeParams &params, const TileCursor &cursor) {
     const int s_q_idx = cta_s_q_idx();
     const int lane_idx = threadIdx.x % 32;
-    const bool is_extra_block = cursor.block_idx >= cursor.num_orig_blocks;
-    const int pos = (is_extra_block ? cursor.block_idx - cursor.num_orig_blocks : cursor.block_idx) * B_TOPK + lane_idx;
+    const bool is_extra_block = is_extra_block_at<EXTRA_FIRST>(cursor);
+    // The block's number in its own cache
+    const int block_in_cache = is_extra_block ? cursor.block_idx - (EXTRA_FIRST ? 0 : cursor.num_orig_blocks)
+                                              : cursor.block_idx - (EXTRA_FIRST ? cursor.num_extra_blocks : 0);
+    const int pos = block_in_cache * B_TOPK + lane_idx;
     const int limit = is_extra_block ? min(cursor.extra_topk_length, params.extra_topk) : min(cursor.topk_length, params.topk);
     int index = -1;
     if (pos < limit) {
@@ -426,6 +449,7 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
     }
 
     if (warp_idx == 0) {
+        constexpr bool EXTRA_FIRST = EXTRA_FP4 && !MAIN_FP4;
         // The gather warp. Issuing the copies of a tile takes it 1500-3000 cycles (they are serialized), and the
         // indices come from memory nobody has touched, so they are loaded one tile ahead of their use.
         TileCursor cursor;
@@ -434,8 +458,8 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
         while (cursor.block_idx >= cursor.end_block_idx) {
             enter_request(cursor, params, partition_idx, cursor.batch_idx + 1);
         }
-        int next_index = load_tile_index(params, cursor);
-        bool is_next_extra_block = cursor.block_idx >= cursor.num_orig_blocks;
+        int next_index = load_tile_index<EXTRA_FIRST>(params, cursor);
+        bool is_next_extra_block = is_extra_block_at<EXTRA_FIRST>(cursor);
         ++cursor.block_idx;
 
         uint32_t raw_idx = 0, raw_phase = 0;
@@ -454,8 +478,8 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
                 while (cursor.block_idx >= cursor.end_block_idx) {
                     enter_request(cursor, params, partition_idx, cursor.batch_idx + 1);
                 }
-                next_index = load_tile_index(params, cursor);
-                is_next_extra_block = cursor.block_idx >= cursor.num_orig_blocks;
+                next_index = load_tile_index<EXTRA_FIRST>(params, cursor);
+                is_next_extra_block = is_extra_block_at<EXTRA_FIRST>(cursor);
                 ++cursor.block_idx;
             }
             gather_tile<EXTRA_FP4, MAIN_FP4>(params, maps, plan, index, is_extra_block, raw_idx, tile_idx);
@@ -1009,13 +1033,13 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
     uint32_t tile_idx = 0;  // The same count as in producer_main
     #pragma unroll 1
     for (int batch_idx = begin_req_idx; batch_idx <= end_req_idx; ++batch_idx) {
-        int block_idx, end_block_idx, fp8_end_block_idx;
+        int block_idx, end_block_idx, fp4_end_block_idx;
         {
             const Request req = get_request(params, partition_idx, batch_idx);
             block_idx = req.start_block_idx;
             end_block_idx = req.end_block_idx;
-            // The tiles of the main cache come first; with EXTRA_FP4 those of the extra cache are fp4 tiles
-            fp8_end_block_idx = EXTRA_FP4 ? min(end_block_idx, req.num_orig_blocks) : end_block_idx;
+            // With EXTRA_FP4 (and not MAIN_FP4) the tiles of the extra cache are fp4 tiles and come first (is_extra_block_at)
+            fp4_end_block_idx = min(end_block_idx, num_extra_blocks_of(req));
         }
         float o_acc[NUM_OUT_TILES][4];  // The output tiles of this warp's 256 columns
         float mi[2], li[2];             // The softmax state of the heads g and g+8
@@ -1042,24 +1066,25 @@ __device__ __forceinline__ void consumer_main(const SparseAttnDecodeParams &para
                 consume_tile<NUM_TERMS, false, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
             }
         } else {
-            if (block_idx < fp8_end_block_idx) {
-                uint32_t q_frag[NUM_TERMS][8][4], q_scale[NUM_TERMS];
-                quantize_q<NUM_TERMS>(q_row(params, batch_idx), 8 * (int64_t)params.stride_q_h_q, q_frag, q_scale);
+            // The fp4 tiles of the extra cache first, with Q as the A fragments of the 4 fp4 MMAs (k = 64 dims each) of this warp
+            if (block_idx < fp4_end_block_idx) {
+                uint32_t q_frag[FP4_Q_TERMS][4][4], q_scale[FP4_Q_TERMS][2];
+                quantize_q_nvfp4<FP4_Q_TERMS>(q_row(params, batch_idx), 8 * (int64_t)params.stride_q_h_q, q_frag, q_scale);
                 start_request(o_acc, mi, li);
                 #pragma unroll 1
-                for (; block_idx < fp8_end_block_idx; ++block_idx, ++tile_idx) {
-                    consume_tile<NUM_TERMS, false, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
+                for (; block_idx < fp4_end_block_idx; ++block_idx, ++tile_idx) {
+                    consume_tile<NUM_TERMS, true, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
                 }
             } else {
                 start_request(o_acc, mi, li);
             }
             if (block_idx < end_block_idx) {
-                // Q again, as the A fragments of the 4 fp4 MMAs (k = 64 dims each) of this warp
-                uint32_t q_frag[FP4_Q_TERMS][4][4], q_scale[FP4_Q_TERMS][2];
-                quantize_q_nvfp4<FP4_Q_TERMS>(q_row(params, batch_idx), 8 * (int64_t)params.stride_q_h_q, q_frag, q_scale);
+                // Then the fp8 tiles of the main cache, with Q as the A fragments of 8 MMAs (k = 32 dims each)
+                uint32_t q_frag[NUM_TERMS][8][4], q_scale[NUM_TERMS];
+                quantize_q<NUM_TERMS>(q_row(params, batch_idx), 8 * (int64_t)params.stride_q_h_q, q_frag, q_scale);
                 #pragma unroll 1
                 for (; block_idx < end_block_idx; ++block_idx, ++tile_idx) {
-                    consume_tile<NUM_TERMS, true, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
+                    consume_tile<NUM_TERMS, false, false>(params, plan, tile_idx, q_frag, q_scale, o_acc, mi, li);
                 }
             }
         }

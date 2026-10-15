@@ -514,6 +514,7 @@ class Mode:
     p_pre: str = "f32"                  # f32 | bf16: P is rounded to bf16 before the quantization (FlashInfer keeps P in a bf16 shared memory tile)
     q_rule: str = "legacy"              # legacy (q_kernel_rule decides) | ceil | rn: the scale rule of the NVFP4 Q terms
     q_smooth: bool = False              # Q' = Q - mean over the heads of a 64-head group (per request row); mean . K is added back exactly
+    extra_first: bool = False           # a V41_FP4Sparse extra cache next to a V41_FP8Sparse main cache comes first in the token order (the mxfp8 kernel)
 
     def ops(self, layout) -> OperandMode:
         return {quant.KVCacheLayout.V41_FP8Sparse: self.fp8, quant.KVCacheLayout.V41_FP4Sparse: self.fp4, quant.KVCacheLayout.V41_MXFP4Sparse: self.mxfp4}[layout]
@@ -978,6 +979,8 @@ def simulate_decode(p, t, mode: Mode) -> Tuple[torch.Tensor, torch.Tensor]:
     q = t.q.reshape(bs, h, d).float()
     scopes = [t.kv_scope] + ([t.extra_kv_scope] if t.extra_kv_scope is not None else [])
     sds = [gather_scope(s, b, s_q) for s in scopes]
+    if mode.extra_first and len(sds) == 2 and (sds[0].layout, sds[1].layout) == (quant.KVCacheLayout.V41_FP8Sparse, quant.KVCacheLayout.V41_FP4Sparse):
+        sds = sds[::-1]
     fp4pv = mode.p in FP4_P
     qbar, q_main = None, q
     if mode.q_smooth:

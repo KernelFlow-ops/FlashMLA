@@ -422,8 +422,8 @@ def build_combos() -> List[Tuple[str, str, emu.Mode, Tuple[str, ...]]]:
     #      kernel-nvfp4-fp8x2 = the precise tier (G2a): main FP8 tile = kernel-fp8x2; FP4 tile: Q four NVFP4 terms with a per-head power-of-two second level (pa), P two e4m3 terms,
     #      V hi + lo (d2, lo scale 2^-4), lo x lo not issued (= p3-fp8x2-nvq4pa-v2). Variants: Q x3 / x5, V scale from 6 x the largest 16-dim scale (d2s), Q without the second level
     fp4_tile = lambda q, v8="d2": OM(q, "native", "rebase", v8)
-    add("kernel-nvfp4-mxfp8", "the mxfp8 tier on V41_FP4Sparse tiles (= mxfp8.cu <1, true>): Q x2 NVFP4, V one e4m3 term (d1s), P x1, B=32, fp32 per k64 instruction; main FP8 tile = kernel-mxfp8",
-        NVFP4_KERNEL_FAMILIES, fp8=mx["fp8"], fp4=OM("nvfp4x2", "native", "rebase", "d1s"), p="e4m3x1", **kern)
+    add("kernel-nvfp4-mxfp8", "the mxfp8 tier on V41_FP4Sparse tiles (= mxfp8.cu <1, true>): Q x2 NVFP4, V one e4m3 term (d1s), P x1, B=32, fp32 per k64 instruction; main FP8 tile = kernel-mxfp8; "
+        "an fp4 extra cache next to an fp8 main cache comes first", NVFP4_KERNEL_FAMILIES, fp8=mx["fp8"], fp4=OM("nvfp4x2", "native", "rebase", "d1s"), p="e4m3x1", extra_first=True, **kern)
     add("kernel-nvfp4-fp8x2", "the precise tier on V41_FP4Sparse tiles: Q x4 NVFP4 with a per-head 2^k second level (pa), V hi + lo (d2), P x2, B=32; main FP8 tile = kernel-fp8x2",
         NVFP4_KERNEL_FAMILIES, fp8=x2["fp8"], fp4=fp4_tile("nvfp4x4pa"), p="e4m3x2", **kern)
     add("kernel-nvfp4-fp8x2-q3", "kernel-nvfp4-fp8x2 with Q x3 (second level)", NVFP4_KERNEL_FAMILIES, fp8=x2["fp8"], fp4=fp4_tile("nvfp4x3pa"), p="e4m3x2", **kern)
