@@ -550,7 +550,8 @@ sm120 build), `csrc/params.h`, `csrc/cuda_kernels/kv_cache_format.h` (MXFP4), `f
   3 to 8%; a lookup table does not make it cheaper. The two CTAs of h = 128 convert the same tiles, and sharing that work is untried.
 * A second-level scale for the V4.1 FP4 cache (one power of two per cache, which would fold exactly into the logit scale and the rebase
   exponent) is not exposed: it needs an API argument, and it only matters for caches whose values are far outside the e4m3 scale range.
-* The re-quantization of Q at the switch from main to FP4 extra tiles costs 2 to 3% at b = 512 and 5 to 7% at b = 64 to 128.
+* With an FP4 extra cache, Q is still quantized twice per request: as two NVFP4 terms for the FP4 extra tiles, which run first so
+  that this overlaps the wait for the first tiles, and as e4m3 at the switch to the FP8 main cache tiles.
 * Smallest batches (T <= 4, h = 64): the combine kernel and the per-CTA setup leave us 1.1x to 1.4x behind FlashInfer.
 * The defaults are unchanged: `bf16`; `bf16` / `fp8x2` raise on an MXFP4 cache.
 * Accuracy was measured on synthetic data and the upstream test's data; the effect of the approximate modes and 4-bit caches on
