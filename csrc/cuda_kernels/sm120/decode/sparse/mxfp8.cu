@@ -377,6 +377,32 @@ __device__ __forceinline__ void rebase_fp4_tile_part(SharedMemoryPlan &plan, uin
     }
 }
 
+// Q of the CTA that most likely runs next on this SM into L2, by one producer warp of this CTA (lane l takes the heads l
+// and l + 32). A CTA first loads its 64 KB of Q and quantizes it; at the start of a CTA that load waits on DRAM (the CTAs
+// of a wave start together), while late in a CTA the DRAM has room. One CTA fits on an SM and CTAs start in launch order,
+// so the CTA that starts when this one ends is about one SM count further in that order. Without split-KV a CTA is
+// (head block, query token, request); with it, nothing is prefetched.
+__device__ __forceinline__ void prefetch_next_cta_q(const SparseAttnDecodeParams &params) {
+    if (params.enable_split_kv) {
+        return;
+    }
+    uint32_t num_sms;
+    asm("mov.u32 %0, %%nsmid;\n" : "=r"(num_sms));
+    const uint32_t next = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z) + num_sms;
+    if (next >= gridDim.x * gridDim.y * gridDim.z) {
+        return;
+    }
+    const uint32_t head_block = next % gridDim.x, s_q_idx = next / gridDim.x % gridDim.y, batch_idx = next / (gridDim.x * gridDim.y);
+    #pragma unroll
+    for (int i = 0; i < NUM_HEADS / 32; ++i) {
+        const int head = head_block * NUM_HEADS + 32 * i + threadIdx.x % 32;
+        const bf16 *row = params.q + (int64_t)batch_idx * params.stride_q_b + (int64_t)s_q_idx * params.stride_q_s_q + (int64_t)head * params.stride_q_h_q;
+        if (reinterpret_cast<uintptr_t>(row) % 16 == 0) {  // The bulk prefetch wants 16 B alignment; Q rows need only 4 B
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" :: "l"(row), "r"(D_QK * (int)sizeof(bf16)) : "memory");
+        }
+    }
+}
+
 template<bool EXTRA_FP4, bool MAIN_FP4, bool PAIRED_V>
 __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &params, const GatherMaps &maps, SharedMemoryPlan &plan) {
     const int partition_idx = cta_partition_idx();
@@ -433,6 +459,12 @@ __device__ __forceinline__ void producer_main(const SparseAttnDecodeParams &para
                 ++cursor.block_idx;
             }
             gather_tile<EXTRA_FP4, MAIN_FP4>(params, maps, plan, index, is_extra_block, raw_idx, tile_idx);
+            // Four tiles before the end: early enough for the load, late enough not to compete with this CTA's first tiles. Not
+            // for the 64-head one-term fp8 kernel, which is at the DRAM limit, nor for MAIN_FP4, whose Q quantization is bound
+            // by its arithmetic (and whose 128-head b64 shape got slower)
+            if (!MAIN_FP4 && (PAIRED_V || EXTRA_FP4 || gridDim.x > 1) && tile_idx + 4 == max(num_tiles, 4u)) {
+                prefetch_next_cta_q(params);
+            }
             if (++raw_idx == NUM_RAW_BUFS) {
                 raw_idx = 0;
                 raw_phase ^= 1;
